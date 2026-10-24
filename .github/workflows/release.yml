@@ -54,7 +54,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
-            libxi-dev libxext-dev libgl1-mesa-dev
+            libxi-dev libxext-dev libgl1-mesa-dev qemu-user
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -69,8 +69,10 @@ jobs:
       - name: Unit tests
         run: zig build test --summary all
 
+      # -Dcpu=baseline: a native build targets the runner's CPU and dies with
+      # "Illegal instruction" on older processors
       - name: Build Linux x86_64
-        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ steps.ver.outputs.version }} --prefix out/linux
+        run: zig build -Doptimize=ReleaseSmall -Dcpu=baseline -Dversion=${{ steps.ver.outputs.version }} --prefix out/linux
 
       - name: Build Windows x86_64
         run: zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows -Dversion=${{ steps.ver.outputs.version }} --prefix out/windows
@@ -87,8 +89,9 @@ jobs:
           # Linux: the bare binary, a UPX-packed one, and a tarball with the installer
           install -m 755 out/linux/bin/WooferSoundPad "dist/$base-linux-x86_64"
           upx --best --lzma -q -o "dist/$base-linux-x86_64-compact" out/linux/bin/WooferSoundPad
-          "dist/$base-linux-x86_64" --version
-          "dist/$base-linux-x86_64-compact" --version
+          # Run both on a generic x86_64 CPU, not just the runner's
+          qemu-x86_64 -cpu qemu64 "dist/$base-linux-x86_64" --version
+          qemu-x86_64 -cpu qemu64 "dist/$base-linux-x86_64-compact" --version
 
           pkg=out/pkg-linux/WooferSoundPad
           mkdir -p "$pkg"

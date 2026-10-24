@@ -3,6 +3,12 @@
 Every release is built and published by GitHub Actions from a `v*` tag. The
 section for that version below becomes the release notes.
 
+## [1.0.1] - 2026-10-24
+
+### Fixed
+
+- The Linux binaries of 1.0.0 were built for the build server's processor and crashed with "Illegal instruction" on many CPUs. They now target any x86_64 processor, and every release runs them on a generic CPU before publishing. Windows was not affected.
+
 ## [1.0.0] - 2026-10-24
 
 The first public release.
