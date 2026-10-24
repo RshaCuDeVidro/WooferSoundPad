@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Read the tutorial first
+    url: https://github.com/RshaCuDeVidro/WooferSoundPad/blob/main/docs/TUTORIAL.md
+    about: Setup guides for the virtual microphone, hotkeys, Wayland shortcuts and more.

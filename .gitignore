@@ -1,0 +1,13 @@
+# Build output
+.zig-cache/
+zig-out/
+
+# Partial downloads
+*.part
+
+# Files made by running the app from the repo folder
+/data/
+/portable.txt
+/portable
+shot-*.png
+gif-*.png

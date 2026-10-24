@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install X11 / OpenGL headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+            libxi-dev libxext-dev libgl1-mesa-dev
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        run: zig fmt --check src build.zig assets/assets.zig
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Build (ReleaseSmall)
+        run: zig build -Doptimize=ReleaseSmall -Dversion=0.0.0-ci.${GITHUB_SHA::7}
+
+      - name: Smoke test
+        run: ./zig-out/bin/WooferSoundPad --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WooferSoundPad-linux-x86_64
+          path: zig-out/bin/WooferSoundPad
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64 (cross-compiled)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build (ReleaseSmall, x86_64-windows)
+        run: zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows -Dversion=0.0.0-ci.${GITHUB_SHA::7}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WooferSoundPad-windows-x86_64
+          path: zig-out/bin/WooferSoundPad.exe
+          if-no-files-found: error

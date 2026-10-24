@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=WooferSoundPad
+GenericName=Soundboard
+Comment=A blazing-fast soundboard for Linux & Windows
+Comment[pt_BR]=Um soundboard ultrarrápido para Linux e Windows
+Exec=WooferSoundPad
+Icon=woofersoundpad
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=soundboard;sound;meme;discord;microphone;audio;
+StartupNotify=true
+StartupWMClass=WooferSoundPad
+Actions=stop-all;
+
+[Desktop Action stop-all]
+Name=Stop all sounds
+Name[pt_BR]=Parar todos os sons
+Exec=WooferSoundPad --stop

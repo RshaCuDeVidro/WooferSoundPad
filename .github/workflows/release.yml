@@ -1,0 +1,197 @@
+name: Release
+
+# Push a tag like v1.2.0 to build and publish a release.
+# Run it by hand with a version to publish that version, or without one for a
+# test build you can download from the run (nothing is published).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version without the "v" (e.g. 1.2.0). Leave empty for an unpublished test build.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.17.0
+  UPX_VERSION: 4.2.4
+
+jobs:
+  release:
+    name: Build, package, publish
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"; PUBLISH=true
+          elif [ -n "$INPUT_VERSION" ]; then
+            VERSION="${INPUT_VERSION#v}"; PUBLISH=true
+          else
+            VERSION="0.0.0-dev.${GITHUB_SHA::7}"; PUBLISH=false
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "### WooferSoundPad $VERSION (publish: $PUBLISH)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install X11 / OpenGL headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
+            libxi-dev libxext-dev libgl1-mesa-dev
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install UPX
+        run: |
+          curl -fsSL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" | tar -xJ
+          sudo install -m 755 "upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/upx
+          upx --version | head -1
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Build Linux x86_64
+        run: zig build -Doptimize=ReleaseSmall -Dversion=${{ steps.ver.outputs.version }} --prefix out/linux
+
+      - name: Build Windows x86_64
+        run: zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows -Dversion=${{ steps.ver.outputs.version }} --prefix out/windows
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -eu
+          mkdir -p dist
+          base="WooferSoundPad-$VERSION"
+          docs="README.md README.pt-BR.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md"
+
+          # Linux: the bare binary, a UPX-packed one, and a tarball with the installer
+          install -m 755 out/linux/bin/WooferSoundPad "dist/$base-linux-x86_64"
+          upx --best --lzma -q -o "dist/$base-linux-x86_64-compact" out/linux/bin/WooferSoundPad
+          "dist/$base-linux-x86_64" --version
+          "dist/$base-linux-x86_64-compact" --version
+
+          pkg=out/pkg-linux/WooferSoundPad
+          mkdir -p "$pkg"
+          install -m 755 out/linux/bin/WooferSoundPad "$pkg/WooferSoundPad"
+          install -m 755 packaging/linux/install.sh "$pkg/install.sh"
+          install -m 644 packaging/linux/woofersoundpad.desktop "$pkg/woofersoundpad.desktop"
+          install -m 644 assets/icon-256.png "$pkg/woofersoundpad.png"
+          install -m 644 $docs "$pkg/"
+          tar -C out/pkg-linux --owner=0 --group=0 -czf "dist/$base-linux-x86_64.tar.gz" WooferSoundPad
+
+          # Windows: the .exe, a portable zip (data stays in the folder) and a
+          # compact zip with just the .exe. Not UPX-packed: packed Zig .exe files
+          # crash on start under Wine and trip antivirus heuristics.
+          cp out/windows/bin/WooferSoundPad.exe "dist/$base-windows-x86_64.exe"
+
+          win=out/pkg-windows/WooferSoundPad
+          mkdir -p "$win"
+          cp out/windows/bin/WooferSoundPad.exe "$win/"
+          cp $docs "$win/"
+          printf 'This file turns on portable mode: settings, tools, cache and your\r\nsound library are kept in the "data" folder next to WooferSoundPad.exe.\r\nDelete it to use your user folders instead.\r\n' > "$win/portable.txt"
+          (cd out/pkg-windows && zip -9 -q -r "../../dist/$base-windows-x86_64-portable.zip" WooferSoundPad)
+          (cd out/windows/bin && zip -9 -q "../../../dist/$base-windows-x86_64-compact.zip" WooferSoundPad.exe)
+
+          cd dist
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -la
+
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          base="WooferSoundPad-$VERSION"
+          url="https://github.com/$REPO/releases/download/$TAG"
+          size() { LC_ALL=C numfmt --to=iec-i --suffix=B --format='%.1f' "$(stat -c %s "dist/$1")"; }
+
+          # This version's section of CHANGELOG.md, without its heading
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > changes.md
+          [ -s changes.md ] || echo "See the [changelog](https://github.com/$REPO/blob/main/CHANGELOG.md)." > changes.md
+
+          {
+            echo "<p align=\"center\"><img src=\"https://raw.githubusercontent.com/$REPO/$TAG/assets/banner.png\" alt=\"WooferSoundPad\" width=\"100%\"></p>"
+            echo
+            echo "## Download"
+            echo
+            echo "| | File | Size | |"
+            echo "|---|---|---|---|"
+            echo "| **Windows** | [\`$base-windows-x86_64.exe\`]($url/$base-windows-x86_64.exe) | $(size "$base-windows-x86_64.exe") | One file, double-click and go |"
+            echo "| | [\`$base-windows-x86_64-portable.zip\`]($url/$base-windows-x86_64-portable.zip) | $(size "$base-windows-x86_64-portable.zip") | Portable: everything stays in the folder |"
+            echo "| | [\`$base-windows-x86_64-compact.zip\`]($url/$base-windows-x86_64-compact.zip) | $(size "$base-windows-x86_64-compact.zip") | Compact: just the .exe, zipped |"
+            echo "| **Linux** | [\`$base-linux-x86_64\`]($url/$base-linux-x86_64) | $(size "$base-linux-x86_64") | One file: \`chmod +x\` and run |"
+            echo "| | [\`$base-linux-x86_64-compact\`]($url/$base-linux-x86_64-compact) | $(size "$base-linux-x86_64-compact") | Compact: UPX-packed, same app |"
+            echo "| | [\`$base-linux-x86_64.tar.gz\`]($url/$base-linux-x86_64.tar.gz) | $(size "$base-linux-x86_64.tar.gz") | With \`install.sh\`: app menu entry and icon |"
+            echo
+            echo "Windows 10 1803+ / 11 and Linux with X11 or Wayland (XWayland), x86_64. New here? Read the [tutorial](https://github.com/$REPO/blob/$TAG/docs/TUTORIAL.md) ([português](https://github.com/$REPO/blob/$TAG/docs/TUTORIAL.pt-BR.md))."
+            echo
+            echo "## What's new"
+            echo
+            cat changes.md
+            echo
+            echo "<details><summary><b>SHA-256 checksums</b></summary>"
+            echo
+            echo '```text'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+            echo
+            echo "\`sha256sum -c SHA256SUMS.txt --ignore-missing\`"
+            echo
+            echo "</details>"
+          } > notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WooferSoundPad-${{ steps.ver.outputs.version }}
+          path: |
+            dist/*
+            notes.md
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: steps.ver.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: WooferSoundPad ${{ steps.ver.outputs.version }}
+          body_path: notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
+          make_latest: ${{ !contains(steps.ver.outputs.version, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/WooferSoundPad-${{ steps.ver.outputs.version }}-windows-x86_64.exe
+            dist/WooferSoundPad-${{ steps.ver.outputs.version }}-windows-x86_64-portable.zip
+            dist/WooferSoundPad-${{ steps.ver.outputs.version }}-windows-x86_64-compact.zip
+            dist/WooferSoundPad-${{ steps.ver.outputs.version }}-linux-x86_64
+            dist/WooferSoundPad-${{ steps.ver.outputs.version }}-linux-x86_64-compact
+            dist/WooferSoundPad-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz
+            dist/SHA256SUMS.txt

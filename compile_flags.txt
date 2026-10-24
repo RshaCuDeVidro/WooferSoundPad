@@ -1,0 +1,4 @@
+-std=c99
+-Ivendor/raylib
+-Ivendor/tinyfiledialogs
+-Isrc/c

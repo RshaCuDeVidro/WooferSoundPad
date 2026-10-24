@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>WooferSoundPad</title>
+  <!-- A woofer cone caught mid-push: the surround and dust cap slide off center -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#FF6B1A"/>
+  <circle cx="128" cy="128" r="86" fill="#141414"/>
+  <circle cx="141" cy="115" r="58" fill="none" stroke="#FF6B1A" stroke-width="11"/>
+  <rect x="129" y="103" width="40" height="40" rx="6" fill="#FF6B1A" transform="rotate(45 149 123)"/>
+</svg>

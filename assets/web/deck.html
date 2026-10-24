@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WooferSoundPad Deck</title>
+<style>
+  :root {
+    --bg: #121212; --side: #0c0c0c; --surface: #1a1a1a; --border: #2b2b2b;
+    --text: #edeae3; --muted: #9e9a92; --faint: #5f5c57; --accent: #ff6b1a; --danger: #ff4a3d;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.3 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    padding: 12px 16px; background: var(--side); border-bottom: 1px solid var(--border); }
+  .brand { font: 700 13px var(--mono); letter-spacing: .02em; margin-right: 8px; }
+  .brand b { color: var(--accent); }
+  .ws { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; }
+  button { font: 600 12px var(--mono); color: var(--text); background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 8px 12px; cursor: pointer; }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  button.stop { background: var(--danger); border-color: var(--danger); color: #fff; }
+  main { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; padding: 16px; }
+  .pad { position: relative; min-height: 96px; padding: 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--surface), var(--c) 10%); display: flex; flex-direction: column;
+    justify-content: space-between; text-align: left; overflow: hidden; }
+  .pad:active { transform: translateY(1px); }
+  .pad.playing { background: color-mix(in srgb, var(--surface), var(--c) 28%); border-color: var(--c); }
+  .pad .top { display: flex; justify-content: space-between; font: 11px var(--mono); color: var(--faint); }
+  .pad .top .hk { color: var(--c); font-weight: 700; }
+  .led { width: 7px; height: 7px; border-radius: 1px; background: #ffffff1f; }
+  .pad.playing .led { background: var(--c); }
+  .pad .name { font-weight: 600; font-size: 14px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pad .bar { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--c); width: 0; }
+  .msg { padding: 40px 16px; color: var(--muted); font: 13px var(--mono); text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">WOOFER<b>PAD</b></span>
+  <div class="ws" id="ws"></div>
+  <button id="fade">FADE</button>
+  <button id="stop" class="stop">STOP</button>
+</header>
+<main id="pads"><div class="msg">Connecting…</div></main>
+<script>
+  const key = new URLSearchParams(location.search).get("key") || "";
+  const api = (cmd, extra = "") => fetch(`/api/${cmd}?key=${encodeURIComponent(key)}${extra}`).catch(() => {});
+  document.getElementById("stop").onclick = () => api("stop");
+  document.getElementById("fade").onclick = () => api("fade");
+  let lastSounds = "";
+
+  function render(state) {
+    const ws = document.getElementById("ws");
+    const names = state.workspaces || [];
+    const wsKey = names.join("\n") + "|" + state.workspace;
+    if (ws.dataset.k !== wsKey) {
+      ws.dataset.k = wsKey;
+      ws.innerHTML = "";
+      if (names.length > 1) for (const n of names) {
+        const b = document.createElement("button");
+        b.textContent = n;
+        if (n === state.workspace) b.className = "on";
+        b.onclick = () => api("workspace", "&name=" + encodeURIComponent(n));
+        ws.appendChild(b);
+      }
+    }
+    const pads = document.getElementById("pads");
+    const sounds = state.sounds || [];
+    const sig = state.workspace + "|" + sounds.map(s => s.uid + s.name + s.color + s.hotkey).join(",");
+    if (sig !== lastSounds) {
+      lastSounds = sig;
+      pads.innerHTML = sounds.length ? "" : '<div class="msg">No sounds in this workspace</div>';
+      sounds.forEach((s, i) => {
+        const b = document.createElement("button");
+        b.className = "pad";
+        b.dataset.uid = s.uid;
+        b.style.setProperty("--c", s.color);
+        b.innerHTML = `<div class="top"><span class="hk"></span><span class="led"></span></div><div class="name"></div><div class="bar"></div>`;
+        b.querySelector(".hk").textContent = s.hotkey || String(i + 1).padStart(2, "0");
+        if (!s.hotkey) b.querySelector(".hk").style.color = "var(--faint)";
+        b.querySelector(".name").textContent = s.name;
+        b.onclick = () => api("play", "&uid=" + s.uid);
+        pads.appendChild(b);
+      });
+    }
+    const playing = new Map((state.playing || []).map(p => [String(p.uid), p]));
+    for (const el of pads.querySelectorAll(".pad")) {
+      const p = playing.get(el.dataset.uid);
+      el.classList.toggle("playing", !!p);
+      el.querySelector(".bar").style.width = p ? (p.progress * 100).toFixed(1) + "%" : "0";
+    }
+  }
+
+  async function poll() {
+    try {
+      const r = await fetch(`/api/state?key=${encodeURIComponent(key)}`);
+      if (r.status === 403) {
+        document.getElementById("pads").innerHTML = '<div class="msg">Wrong or missing key. Copy the link from WooferSoundPad → Settings → Integrations.</div>';
+      } else {
+        render(await r.json());
+      }
+    } catch (e) {
+      document.getElementById("pads").innerHTML = '<div class="msg">WooferSoundPad is not running</div>';
+      lastSounds = "";
+    }
+    setTimeout(poll, 400);
+  }
+  poll();
+</script>
+</body>
+</html>

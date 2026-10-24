@@ -1,0 +1,15 @@
+.{
+    .name = .WooferSoundPad,
+    .version = "0.1.0",
+    .fingerprint = 0x84b9b0a0b4255cfe, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    // raylib, miniaudio e tinyfiledialogs ficam em vendor/ e são compilados direto
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "assets",
+        "vendor",
+    },
+}
