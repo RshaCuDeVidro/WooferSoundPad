@@ -49,12 +49,12 @@ jobs:
           echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
           echo "### WooferSoundPad $VERSION (publish: $PUBLISH)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install X11 / OpenGL headers
+      - name: Install X11 / OpenGL headers and NSIS
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev \
-            libxi-dev libxext-dev libgl1-mesa-dev qemu-user
+            libxi-dev libxext-dev libgl1-mesa-dev qemu-user nsis
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -84,7 +84,7 @@ jobs:
           set -eu
           mkdir -p dist
           base="WooferSoundPad-$VERSION"
-          docs="README.md README.pt-BR.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md"
+          docs="README.md README.pt-BR.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md SECURITY.md PRIVACY.md"
 
           # Linux: the bare binary, a UPX-packed one, and a tarball with the installer
           install -m 755 out/linux/bin/WooferSoundPad "dist/$base-linux-x86_64"
@@ -96,9 +96,8 @@ jobs:
           pkg=out/pkg-linux/WooferSoundPad
           mkdir -p "$pkg"
           install -m 755 out/linux/bin/WooferSoundPad "$pkg/WooferSoundPad"
+          # install.sh runs the app's own installer (icons and menu entry are built in)
           install -m 755 packaging/linux/install.sh "$pkg/install.sh"
-          install -m 644 packaging/linux/woofersoundpad.desktop "$pkg/woofersoundpad.desktop"
-          install -m 644 assets/icon-256.png "$pkg/woofersoundpad.png"
           install -m 644 $docs "$pkg/"
           tar -C out/pkg-linux --owner=0 --group=0 -czf "dist/$base-linux-x86_64.tar.gz" WooferSoundPad
 
@@ -114,6 +113,22 @@ jobs:
           printf 'This file turns on portable mode: settings, tools, cache and your\r\nsound library are kept in the "data" folder next to WooferSoundPad.exe.\r\nDelete it to use your user folders instead.\r\n' > "$win/portable.txt"
           (cd out/pkg-windows && zip -9 -q -r "../../dist/$base-windows-x86_64-portable.zip" WooferSoundPad)
           (cd out/windows/bin && zip -9 -q "../../../dist/$base-windows-x86_64-compact.zip" WooferSoundPad.exe)
+
+          # Windows installer: Start menu and desktop shortcuts, uninstall from
+          # Settings > Apps. Per user, so the app can keep updating itself.
+          makensis -INPUTCHARSET UTF8 -V2 \
+            -DVERSION="$VERSION" -DVI_VERSION="${VERSION%%-*}.0" \
+            -DEXE="$PWD/out/windows/bin/WooferSoundPad.exe" \
+            -DOUTFILE="$PWD/dist/$base-windows-x86_64-setup.exe" \
+            packaging/windows/installer.nsi
+
+          # Linux .deb (Debian, Ubuntu, Mint...): system-wide, with the menu entry
+          # and icons. Installed and removed once here to prove it works.
+          packaging/linux/build-deb.sh out/linux/bin/WooferSoundPad "$VERSION" "dist/$base-linux-x86_64.deb"
+          sudo dpkg -i "dist/$base-linux-x86_64.deb"
+          WooferSoundPad --version
+          test -f /usr/share/applications/woofersoundpad.desktop
+          sudo dpkg -r woofersoundpad
 
           cd dist
           sha256sum -- * > SHA256SUMS.txt
@@ -146,10 +161,12 @@ jobs:
             echo
             echo "| | File | Size | |"
             echo "|---|---|---|---|"
-            echo "| **Windows** | [\`$base-windows-x86_64.exe\`]($url/$base-windows-x86_64.exe) | $(size "$base-windows-x86_64.exe") | One file, double-click and go |"
+            echo "| **Windows** | [\`$base-windows-x86_64-setup.exe\`]($url/$base-windows-x86_64-setup.exe) | $(size "$base-windows-x86_64-setup.exe") | Installer: Start menu, desktop shortcut, uninstall from Settings |"
+            echo "| | [\`$base-windows-x86_64.exe\`]($url/$base-windows-x86_64.exe) | $(size "$base-windows-x86_64.exe") | One file, double-click and go |"
             echo "| | [\`$base-windows-x86_64-portable.zip\`]($url/$base-windows-x86_64-portable.zip) | $(size "$base-windows-x86_64-portable.zip") | Portable: everything stays in the folder |"
             echo "| | [\`$base-windows-x86_64-compact.zip\`]($url/$base-windows-x86_64-compact.zip) | $(size "$base-windows-x86_64-compact.zip") | Compact: just the .exe, zipped |"
-            echo "| **Linux** | [\`$base-linux-x86_64\`]($url/$base-linux-x86_64) | $(size "$base-linux-x86_64") | One file: \`chmod +x\` and run |"
+            echo "| **Linux** | [\`$base-linux-x86_64.deb\`]($url/$base-linux-x86_64.deb) | $(size "$base-linux-x86_64.deb") | Debian, Ubuntu, Mint: double-click, it lands in the app menu |"
+            echo "| | [\`$base-linux-x86_64\`]($url/$base-linux-x86_64) | $(size "$base-linux-x86_64") | One file: \`chmod +x\`, run it, and it offers to add itself to the app menu |"
             echo "| | [\`$base-linux-x86_64-compact\`]($url/$base-linux-x86_64-compact) | $(size "$base-linux-x86_64-compact") | Compact: UPX-packed, same app |"
             echo "| | [\`$base-linux-x86_64.tar.gz\`]($url/$base-linux-x86_64.tar.gz) | $(size "$base-linux-x86_64.tar.gz") | With \`install.sh\`: app menu entry and icon |"
             echo
@@ -191,10 +208,12 @@ jobs:
           make_latest: ${{ !contains(steps.ver.outputs.version, '-') }}
           fail_on_unmatched_files: true
           files: |
+            dist/WooferSoundPad-${{ steps.ver.outputs.version }}-windows-x86_64-setup.exe
             dist/WooferSoundPad-${{ steps.ver.outputs.version }}-windows-x86_64.exe
             dist/WooferSoundPad-${{ steps.ver.outputs.version }}-windows-x86_64-portable.zip
             dist/WooferSoundPad-${{ steps.ver.outputs.version }}-windows-x86_64-compact.zip
             dist/WooferSoundPad-${{ steps.ver.outputs.version }}-linux-x86_64
             dist/WooferSoundPad-${{ steps.ver.outputs.version }}-linux-x86_64-compact
             dist/WooferSoundPad-${{ steps.ver.outputs.version }}-linux-x86_64.tar.gz
+            dist/WooferSoundPad-${{ steps.ver.outputs.version }}-linux-x86_64.deb
             dist/SHA256SUMS.txt
