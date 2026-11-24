@@ -16,3 +16,11 @@ pub const icon_256 = @embedFile("icon-256.png");
 pub const icon_64 = @embedFile("icon-64.png");
 pub const icon_32 = @embedFile("icon-32.png");
 pub const logo_mark = @embedFile("logo-mark-128.png");
+
+// Linux app menu icons (hicolor theme), written by `--install`
+pub const icon_16 = @embedFile("icon-16.png");
+pub const icon_24 = @embedFile("icon-24.png");
+pub const icon_48 = @embedFile("icon-48.png");
+pub const icon_128 = @embedFile("icon-128.png");
+pub const icon_512 = @embedFile("icon-512.png");
+pub const icon_svg = @embedFile("logo-mark.svg");

@@ -82,10 +82,29 @@ typedef struct {
     ma_bool32 is_default;
 } WoofCapture;
 
+// One per output, between every effect node and the endpoint: EQ, compressor,
+// the global effect chain (crossfaded in and out) and the limiter.
+#define MASTER_BLOCK 1024
+
+typedef struct {
+    ma_node_base base; // must stay first
+    WoofMasterDsp dsp;
+    WoofMaster params[2]; // the audio thread reads params[params_front]
+    ma_uint32 params_front;
+    WoofDsp fx;
+    WoofFx chains[2][WOOF_FX_MAX];
+    int counts[2];
+    ma_uint32 front;
+    volatile ma_uint32 fx_on;
+    float fx_mix; // 0 = dry .. 1 = fully through the global chain
+    float dry[MASTER_BLOCK * WOOF_DSP_CH];
+} WoofMasterNode;
+
 typedef struct {
     ma_engine engine;
     ma_bool32 active;
     float volume;
+    WoofMasterNode *master;
     WoofVoices sounds[WOOF_MAX_SOUNDS];
 } WoofOutput;
 
@@ -103,6 +122,7 @@ typedef struct {
     float volume; // pad volume of the current play
     float live_volume; // mixer multiplier
     ma_bool32 muted;
+    int route; // WOOF_ROUTE_* bits
 } WoofSound;
 
 static ma_context g_context;
@@ -116,6 +136,11 @@ static ma_sound g_preview;
 static ma_bool32 g_preview_loaded;
 static WoofCapture g_captures[WOOF_MAX_DEVICES];
 static int g_capture_count;
+// Master settings, kept here so a re-created output gets them too
+static WoofMaster g_master = {0, 0, 0, 0, 1};
+static WoofFx g_global_fx[WOOF_FX_MAX];
+static int g_global_fx_count;
+static ma_bool32 g_global_fx_on;
 
 static const ma_uint32 k_sound_flags = MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC | MA_SOUND_FLAG_NO_SPATIALIZATION;
 
@@ -233,6 +258,122 @@ static void fx_free(WoofFxNode **node) {
     *node = NULL;
 }
 
+// ── Master node ─────────────────────────────────────────────────────────────
+
+static void master_block(WoofMasterNode *n, float *out, ma_uint32 frames) {
+    const ma_uint32 ch = n->dsp.channels;
+    const WoofMaster p = n->params[ma_atomic_load_32(&n->params_front) & 1];
+    master_process(&n->dsp, &p, out, frames);
+
+    // Global effect: runs on a copy and crossfades over ~30 ms, so pressing
+    // and releasing the key never clicks
+    const float target = ma_atomic_load_32(&n->fx_on) ? 1.0f : 0.0f;
+    if (n->fx_mix <= 0 && target <= 0) return;
+    if (n->fx_mix <= 0) dsp_reset(&n->fx); // no stale echo from the last time
+    ma_uint32 f = ma_atomic_load_32(&n->front) & 1;
+    int count = n->counts[f];
+    if (count <= 0) {
+        n->fx_mix = 0;
+        return;
+    }
+    WoofFx chain[WOOF_FX_MAX];
+    if (count > WOOF_FX_MAX) count = WOOF_FX_MAX;
+    memcpy(chain, n->chains[f], sizeof(WoofFx) * (size_t)count);
+    memcpy(n->dry, out, (size_t)frames * ch * sizeof(float));
+    dsp_process(&n->fx, chain, count, out, frames);
+    const float step = 1.0f / (0.03f * (float)n->dsp.rate);
+    for (ma_uint32 i = 0; i < frames; i++) {
+        n->fx_mix += n->fx_mix < target ? step : -step;
+        n->fx_mix = n->fx_mix < 0 ? 0 : (n->fx_mix > 1 ? 1 : n->fx_mix);
+        for (ma_uint32 c = 0; c < ch; c++) {
+            const size_t k = (size_t)i * ch + c;
+            out[k] = n->dry[k] + (out[k] - n->dry[k]) * n->fx_mix;
+        }
+    }
+}
+
+static void master_node_process(ma_node *node, const float **frames_in, ma_uint32 *count_in, float **frames_out, ma_uint32 *count_out) {
+    WoofMasterNode *n = (WoofMasterNode *)node;
+    ma_uint32 frames = *count_out;
+    if (*count_in < frames) frames = *count_in;
+    const ma_uint32 ch = n->dsp.channels;
+    float *out = frames_out[0];
+    if (frames_in != NULL && frames_in[0] != NULL) {
+        memcpy(out, frames_in[0], (size_t)frames * ch * sizeof(float));
+    } else {
+        memset(out, 0, (size_t)frames * ch * sizeof(float));
+    }
+    for (ma_uint32 done = 0; done < frames; done += MASTER_BLOCK) {
+        ma_uint32 len = frames - done < MASTER_BLOCK ? frames - done : MASTER_BLOCK;
+        master_block(n, out + (size_t)done * ch, len);
+    }
+    *count_in = frames;
+    *count_out = frames;
+}
+
+static ma_node_vtable g_master_vtable = {master_node_process, NULL, 1, 1, MA_NODE_FLAG_CONTINUOUS_PROCESSING};
+
+// UI thread: same double buffering as the per-voice effect chains
+static void master_push(WoofMasterNode *n) {
+    ma_uint32 back = 1 - (ma_atomic_load_32(&n->params_front) & 1);
+    n->params[back] = g_master;
+    ma_atomic_exchange_32(&n->params_front, back);
+
+    dsp_prepare(&n->fx, g_global_fx, g_global_fx_count);
+    back = 1 - (ma_atomic_load_32(&n->front) & 1);
+    if (g_global_fx_count > 0) memcpy(n->chains[back], g_global_fx, sizeof(WoofFx) * (size_t)g_global_fx_count);
+    n->counts[back] = g_global_fx_count;
+    ma_atomic_exchange_32(&n->front, back);
+    ma_atomic_exchange_32(&n->fx_on, g_global_fx_on ? 1 : 0);
+}
+
+static WoofMasterNode *master_create(WoofOutput *out) {
+    ma_uint32 channels = ma_engine_get_channels(&out->engine);
+    if (channels == 0 || channels > WOOF_DSP_CH) return NULL;
+    WoofMasterNode *n = (WoofMasterNode *)calloc(1, sizeof(WoofMasterNode));
+    if (n == NULL) return NULL;
+    ma_node_config config = ma_node_config_init();
+    config.vtable = &g_master_vtable;
+    config.pInputChannels = &channels;
+    config.pOutputChannels = &channels;
+    if (ma_node_init(ma_engine_get_node_graph(&out->engine), &config, NULL, &n->base) != MA_SUCCESS) {
+        free(n);
+        return NULL;
+    }
+    ma_uint32 rate = ma_engine_get_sample_rate(&out->engine);
+    master_init(&n->dsp, channels, rate);
+    dsp_init(&n->fx, channels, rate);
+    master_push(n);
+    ma_node_attach_output_bus(&n->base, 0, ma_engine_get_endpoint(&out->engine), 0);
+    return n;
+}
+
+static void master_free(WoofMasterNode **node) {
+    if (*node == NULL) return;
+    ma_node_uninit(&(*node)->base, NULL);
+    dsp_free(&(*node)->fx);
+    free(*node);
+    *node = NULL;
+}
+
+// ── Routing ─────────────────────────────────────────────────────────────────
+
+static ma_bool32 routed(int id, int slot) {
+    return (g_sounds[id].route >> slot) & 1 ? MA_TRUE : MA_FALSE;
+}
+
+// The output whose voices tell what a sound is doing: the first active one
+// it is routed to (any active one, so loading and lengths still work)
+static WoofOutput *sound_output(int id) {
+    for (int i = 0; i < WOOF_OUT_COUNT; i++) {
+        if (g_outputs[i].active && routed(id, i)) return &g_outputs[i];
+    }
+    for (int i = 0; i < WOOF_OUT_COUNT; i++) {
+        if (g_outputs[i].active) return &g_outputs[i];
+    }
+    return NULL;
+}
+
 // The effect node of a voice, created and wired in on first use
 static WoofFxNode *voice_fx(WoofOutput *out, int id, int v) {
     WoofVoices *voices = &out->sounds[id];
@@ -253,7 +394,8 @@ static WoofFxNode *voice_fx(WoofOutput *out, int id, int v) {
     n->running = MA_TRUE;
     dsp_init(&n->dsp, channels, ma_engine_get_sample_rate(&out->engine));
     fx_push(n, g_sounds[id].fx, g_sounds[id].fx_count);
-    ma_node_attach_output_bus(&n->base, 0, ma_engine_get_endpoint(&out->engine), 0);
+    ma_node *dest = out->master != NULL ? (ma_node *)&out->master->base : ma_engine_get_endpoint(&out->engine);
+    ma_node_attach_output_bus(&n->base, 0, dest, 0);
     ma_node_attach_output_bus(voices->voices[v], 0, &n->base, 0);
     voices->fx[v] = n;
     return n;
@@ -307,16 +449,9 @@ static void output_unload_sound(WoofOutput *out, int id) {
 static void output_shutdown(WoofOutput *out) {
     if (!out->active) return;
     for (int id = 0; id < WOOF_MAX_SOUNDS; id++) output_unload_sound(out, id);
+    master_free(&out->master);
     ma_engine_uninit(&out->engine);
     out->active = MA_FALSE;
-}
-
-// The output whose voices decide what "playing" means (monitor, or the mic if the monitor failed)
-static WoofOutput *reference_output(void) {
-    for (int i = 0; i < WOOF_OUT_COUNT; i++) {
-        if (g_outputs[i].active) return &g_outputs[i];
-    }
-    return NULL;
 }
 
 int woof_init(void) {
@@ -407,6 +542,7 @@ int woof_set_output(int slot, int device_index) {
     if (ma_engine_init(&config, &out->engine) != MA_SUCCESS) return -1;
     out->active = MA_TRUE;
     ma_engine_set_volume(&out->engine, out->volume);
+    out->master = master_create(out);
 
     for (int id = 0; id < WOOF_MAX_SOUNDS; id++) {
         if (g_sounds[id].path != NULL) output_load_sound(out, id);
@@ -451,6 +587,7 @@ int woof_load(const char *path) {
     g_sounds[id].volume = 1;
     g_sounds[id].live_volume = 1;
     g_sounds[id].muted = MA_FALSE;
+    g_sounds[id].route = WOOF_ROUTE_BOTH;
 
     ma_bool32 ok = MA_FALSE;
     for (int i = 0; i < WOOF_OUT_COUNT; i++) {
@@ -474,7 +611,7 @@ void woof_unload(int id) {
 
 static ma_sound *reference_voice(int id, int voice) {
     if (id < 0 || id >= WOOF_MAX_SOUNDS || g_sounds[id].path == NULL) return NULL;
-    WoofOutput *out = reference_output();
+    WoofOutput *out = sound_output(id);
     if (out == NULL) return NULL;
     return out->sounds[id].voices[voice];
 }
@@ -499,7 +636,7 @@ static ma_bool32 voice_playing(ma_sound *voice) {
 
 // Picks the voice slot to (re)start for an overlapping play
 static int pick_voice(int id) {
-    WoofOutput *ref = reference_output();
+    WoofOutput *ref = sound_output(id);
     int oldest = 0;
     float oldest_cursor = -1;
     for (int v = 0; v < WOOF_MAX_VOICES; v++) {
@@ -565,7 +702,7 @@ void woof_play(int id, float volume, int mode) {
     g_sounds[id].live_volume = 1;
     g_sounds[id].muted = MA_FALSE;
     for (int i = 0; i < WOOF_OUT_COUNT; i++) {
-        if (g_outputs[i].active) start_voice(&g_outputs[i], id, v, volume);
+        if (g_outputs[i].active && routed(id, i)) start_voice(&g_outputs[i], id, v, volume);
     }
     g_sounds[id].last_voice = v;
 }
@@ -642,6 +779,22 @@ void woof_set_params(int id, float trim_start, float trim_end, int loop, float s
     }
 }
 
+void woof_set_route(int id, int route) {
+    if (!valid_id(id)) return;
+    g_sounds[id].route = route & WOOF_ROUTE_BOTH;
+    // Outputs it no longer goes to fall silent right away
+    for (int i = 0; i < WOOF_OUT_COUNT; i++) {
+        if (!g_outputs[i].active || routed(id, i)) continue;
+        WoofVoices *voices = &g_outputs[i].sounds[id];
+        for (int v = 0; v < WOOF_MAX_VOICES; v++) {
+            if (voices->voices[v] != NULL) ma_sound_stop(voices->voices[v]);
+            voices->paused[v] = MA_FALSE;
+            voices->fading[v] = MA_FALSE;
+            voices->fade_stop[v] = MA_FALSE;
+        }
+    }
+}
+
 float woof_full_length(int id) {
     ma_sound *voice = reference_voice(id, 0);
     if (voice == NULL) return 0;
@@ -682,7 +835,7 @@ void woof_resume(int id) {
 
 int woof_is_paused(int id) {
     if (!valid_id(id)) return 0;
-    WoofOutput *out = reference_output();
+    WoofOutput *out = sound_output(id);
     if (out == NULL) return 0;
     for (int v = 0; v < WOOF_MAX_VOICES; v++) {
         if (out->sounds[id].paused[v]) return 1;
@@ -876,6 +1029,35 @@ void woof_set_fx(int id, const WoofFx *chain, int count) {
     }
 }
 
+// ── Master bus ──────────────────────────────────────────────────────────────
+
+static void master_push_all(void) {
+    for (int i = 0; i < WOOF_OUT_COUNT; i++) {
+        if (g_outputs[i].active && g_outputs[i].master != NULL) master_push(g_outputs[i].master);
+    }
+}
+
+void woof_set_master(const WoofMaster *m) {
+    if (m == NULL) return;
+    g_master = *m;
+    master_push_all();
+}
+
+void woof_set_global_fx(const WoofFx *chain, int count) {
+    if (count < 0 || chain == NULL) count = 0;
+    if (count > WOOF_FX_MAX) count = WOOF_FX_MAX;
+    if (count > 0) memcpy(g_global_fx, chain, sizeof(WoofFx) * (size_t)count);
+    g_global_fx_count = count;
+    master_push_all();
+}
+
+void woof_set_global_fx_on(int on) {
+    g_global_fx_on = on ? MA_TRUE : MA_FALSE;
+    for (int i = 0; i < WOOF_OUT_COUNT; i++) {
+        if (g_outputs[i].active && g_outputs[i].master != NULL) ma_atomic_exchange_32(&g_outputs[i].master->fx_on, on ? 1 : 0);
+    }
+}
+
 // ── Mixer ───────────────────────────────────────────────────────────────────
 
 void woof_set_live_volume(int id, float volume) {
@@ -920,7 +1102,7 @@ void woof_fade_stop(int id, float seconds) {
 
 int woof_is_fading(int id) {
     if (!valid_id(id)) return 0;
-    WoofOutput *out = reference_output();
+    WoofOutput *out = sound_output(id);
     if (out == NULL) return 0;
     for (int v = 0; v < WOOF_MAX_VOICES; v++) {
         if (out->sounds[id].fade_stop[v] && voice_playing(out->sounds[id].voices[v])) return 1;
@@ -930,7 +1112,7 @@ int woof_is_fading(int id) {
 
 float woof_level(int id) {
     if (!valid_id(id)) return 0;
-    WoofOutput *out = reference_output();
+    WoofOutput *out = sound_output(id);
     if (out == NULL) return 0;
     float peak = 0;
     for (int v = 0; v < WOOF_MAX_VOICES; v++) {
@@ -1293,6 +1475,85 @@ int woof_loudness(const char *path, float *loudness_db, float *peak_db) {
     if (loudness_db) *loudness_db = (float)(10.0 * log10(gated / (double)m));
     if (peak_db) *peak_db = peak > 0 ? 20.0f * log10f(peak) : -100.0f;
     return 0;
+}
+
+// ── Export ──────────────────────────────────────────────────────────────────
+
+int woof_export_wav(const char *path, float start, float end, int rate, int channels, const char *out_path) {
+    if (path == NULL || out_path == NULL || rate <= 0 || channels < 1 || channels > 2) return -1;
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, (ma_uint32)channels, (ma_uint32)rate);
+    ma_decoder decoder;
+#ifdef _WIN32
+    wchar_t *wide = utf8_to_wide(path);
+    if (wide == NULL) return -1;
+    ma_result result = ma_decoder_init_file_w(wide, &config, &decoder);
+    free(wide);
+#else
+    ma_result result = ma_decoder_init_file(path, &config, &decoder);
+#endif
+    if (result != MA_SUCCESS) return -1;
+
+    ma_uint64 from = start > 0 ? (ma_uint64)((double)start * rate) : 0;
+    ma_uint64 to = end > 0 ? (ma_uint64)((double)end * rate) : ~(ma_uint64)0;
+    if (to <= from || (from > 0 && ma_decoder_seek_to_pcm_frame(&decoder, from) != MA_SUCCESS)) {
+        ma_decoder_uninit(&decoder);
+        return -1;
+    }
+    FILE *f = open_utf8(out_path, "wb");
+    if (f == NULL) {
+        ma_decoder_uninit(&decoder);
+        return -1;
+    }
+    // Sizes are patched in once the length is known
+    unsigned char h[44];
+    memcpy(h, "RIFF", 4);
+    put_u32(h + 4, 36);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    put_u32(h + 16, 16);
+    put_u16(h + 20, 1); // PCM
+    put_u16(h + 22, (ma_uint16)channels);
+    put_u32(h + 24, (ma_uint32)rate);
+    put_u32(h + 28, (ma_uint32)(rate * channels * 2));
+    put_u16(h + 32, (ma_uint16)(channels * 2));
+    put_u16(h + 34, 16);
+    memcpy(h + 36, "data", 4);
+    put_u32(h + 40, 0);
+    int ok = fwrite(h, 1, sizeof(h), f) == sizeof(h);
+
+    const ma_uint64 total = to == ~(ma_uint64)0 ? 0 : to - from;
+    const ma_uint64 fade = (ma_uint64)rate / 200; // 5 ms
+    float chunk[4096 * 2];
+    unsigned char buf[4096 * 2 * 2];
+    ma_uint64 written = 0;
+    const ma_uint64 limit = (ma_uint64)WOOF_REC_MAX_SECONDS * 6 * (ma_uint64)rate; // an hour
+    while (ok && written < (total > 0 ? total : limit)) {
+        ma_uint64 want = 4096;
+        if (total > 0 && total - written < want) want = total - written;
+        ma_uint64 got = 0;
+        if (ma_decoder_read_pcm_frames(&decoder, chunk, want, &got) != MA_SUCCESS || got == 0) break;
+        for (ma_uint64 i = 0; i < got; i++) {
+            const ma_uint64 at = written + i;
+            float g = 1;
+            if (at < fade) g = (float)at / (float)fade;
+            if (total > 0 && total - at < fade) g = fminf(g, (float)(total - at) / (float)fade);
+            for (int ch = 0; ch < channels; ch++) {
+                float v = chunk[i * (ma_uint64)channels + (ma_uint64)ch] * g;
+                v = v > 1 ? 1 : (v < -1 ? -1 : v);
+                put_u16(buf + (i * (ma_uint64)channels + (ma_uint64)ch) * 2, (ma_uint16)(ma_int16)(v * 32767.0f));
+            }
+        }
+        const size_t bytes = (size_t)got * (size_t)channels * 2;
+        ok = fwrite(buf, 1, bytes, f) == bytes;
+        written += got;
+    }
+    ma_decoder_uninit(&decoder);
+
+    const ma_uint32 data_bytes = (ma_uint32)(written * (ma_uint64)channels * 2);
+    put_u32(h + 4, 36 + data_bytes);
+    put_u32(h + 40, data_bytes);
+    if (ok) ok = fseek(f, 0, SEEK_SET) == 0 && fwrite(h, 1, sizeof(h), f) == sizeof(h);
+    if (fclose(f) != 0) ok = 0;
+    return ok && written > 0 ? 0 : -1;
 }
 
 // ── Misc ────────────────────────────────────────────────────────────────────

@@ -46,6 +46,13 @@ int woof_is_playing(int id);
 float woof_cursor(int id); // seconds into the most recent voice, relative to the trim start
 int woof_playing_count(void);
 
+// Which outputs a sound plays on. Every sound starts on both; "playing",
+// the cursor and the meters follow the first active output it is routed to.
+#define WOOF_ROUTE_MONITOR 1
+#define WOOF_ROUTE_MIC 2
+#define WOOF_ROUTE_BOTH 3
+void woof_set_route(int id, int route);
+
 // Per-sound playback settings, applied without touching the file.
 // trim_end <= 0 means "until the end". speed 1 = normal (also shifts pitch).
 void woof_set_params(int id, float trim_start, float trim_end, int loop, float speed, float fade_in, float fade_out);
@@ -105,6 +112,21 @@ typedef struct {
 // Applies live, also to voices that are playing right now
 void woof_set_fx(int id, const WoofFx *chain, int count);
 
+// ── Master bus ──────────────────────────────────────────────────────────────
+// Everything the pads play (not the preview) goes through one master stage per
+// output: a 3-band EQ, a compressor, the global effect chain while it is on,
+// and a limiter that keeps the sum below 0 dBFS.
+
+typedef struct {
+    float eq_low, eq_mid, eq_high; // dB, -12..12: shelves at 120 Hz / 8 kHz, peak at 1 kHz
+    float comp;                    // 0 = off .. 1 = heavy
+    int limiter;
+} WoofMaster;
+
+void woof_set_master(const WoofMaster *m);
+void woof_set_global_fx(const WoofFx *chain, int count);
+void woof_set_global_fx_on(int on); // fades in / out over a few milliseconds
+
 // ── Mixer ───────────────────────────────────────────────────────────────────
 // Live controls for what is playing. They reset on the next play.
 
@@ -146,6 +168,11 @@ void woof_rec_discard(void);
 // broadcast meters minus the K-weighting) and its sample peak in dBFS.
 // Thread-safe (does not touch the engine). Returns 0 on success.
 int woof_loudness(const char *path, float *loudness_db, float *peak_db);
+
+// Decodes [start, end) seconds of a file (end <= 0: until the end) and writes
+// it as a 16-bit WAV at `rate` Hz with `channels` channels, with 5 ms fades at
+// both edges. Thread-safe (does not touch the engine). Returns 0 on success.
+int woof_export_wav(const char *path, float start, float end, int rate, int channels, const char *out_path);
 
 // Seconds east of UTC right now (for "today" in statistics)
 int woof_utc_offset(void);

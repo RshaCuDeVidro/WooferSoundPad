@@ -15,9 +15,10 @@
 
 Dispare sons no Discord, nos jogos e nas lives com atalhos. Deforme tudo ao vivo com uma cadeia de efeitos,<br>
 controle os níveis num mixer, vá pra tela cheia no Stage Mode, grave qualquer coisa que o PC tocar.<br>
-Um executável nativo. Sem Electron, sem conta, sem chave de API.
+Um executável nativo. Sem Electron, sem conta, sem telemetria, sem chave de API.
 
 **[Download](https://github.com/RshaCuDeVidro/WooferSoundPad/releases/latest)** &nbsp;·&nbsp;
+**[Novidades](CHANGELOG.pt-BR.md)** &nbsp;·&nbsp;
 **[Tutorial](docs/TUTORIAL.pt-BR.md)** &nbsp;·&nbsp;
 **[English](README.md)** &nbsp;·&nbsp;
 **[OBS e Stream Deck](#obs-e-stream-deck)**
@@ -38,21 +39,21 @@ Um executável nativo. Sem Electron, sem conta, sem chave de API.
 
 **TOCAR**
 
-Pads com forma de onda, LED de status e atalho grande na tela. Modos reiniciar, sobrepor ou alternar. Fila com arrastar pra reordenar, embaralhar e repetir. Atalhos globais enquanto você joga. Teclas 0–9.
+Pads com forma de onda, LED de status e atalho grande na tela. Modos reiniciar, sobrepor ou alternar. Fila com arrastar pra reordenar, embaralhar e repetir. Atalhos globais enquanto você joga. Teclas 0–9. Pads que tocam sozinhos a cada N minutos ou num horário.
 
 </td>
 <td width="33%" valign="top">
 
 **MOLDAR**
 
-Doze efeitos ao vivo que você encadeia e reordena: tom, filtros, rádio, distorção, bitcrusher, eco, reverb, chorus, tremolo, robô, ganho. Automatize qualquer parâmetro ao longo do som. Salve presets. Faça variantes do mesmo arquivo.
+Doze efeitos ao vivo que você encadeia e reordena: tom, filtros, rádio, distorção, bitcrusher, eco, reverb, chorus, tremolo, robô, ganho. Automatize qualquer parâmetro ao longo do som. Salve presets. Faça variantes do mesmo arquivo. Equalizador, compressor e limitador no master, e um efeito global enquanto você segura uma tecla.
 
 </td>
 <td width="33%" valign="top">
 
 **SE APRESENTAR**
 
-Um mixer com um canal por som: medidor, fader, mudo, fade-out. Stage Mode: tela cheia, pads gigantes, botão de pânico. Uma botoneira web pro celular e um overlay pro OBS.
+Um mixer com um canal por som: medidor, fader, mudo, fade-out. Stage Mode: tela cheia, pads gigantes, botão de pânico. Uma botoneira web pro celular (é só ler o QR code) e um overlay pro OBS. Mande um pad só pro seu fone ou só pro mic.
 
 </td>
 </tr>
@@ -61,21 +62,21 @@ Um mixer com um canal por som: medidor, fader, mudo, fade-out. Stage Mode: tela 
 
 **EDITAR**
 
-Editor com forma de onda e zoom: arraste pra selecionar, clique pra ouvir, alças de fade na própria onda, início e fim exatos com ajuste de 10 ms, corte automático de silêncio, prévia em loop, desfazer e refazer. Nada mexe no arquivo até você mandar.
+Editor com forma de onda e zoom: arraste pra selecionar, clique pra ouvir, alças de fade na própria onda, início e fim exatos com ajuste de 10 ms, corte automático de silêncio, prévia em loop, desfazer e refazer. Nada mexe no arquivo até você mandar. Fatie uma gravação longa em pads nos silêncios.
 
 </td>
 <td valign="top">
 
 **JUNTAR**
 
-Navegue pelo MyInstants e SoundButtonsWorld dentro do app. Busque no YouTube e no SoundCloud ou cole link de mais de 1000 sites (yt-dlp, sem chave). Grave o que o PC está tocando. Arraste e solte arquivos.
+Navegue pelo MyInstants e SoundButtonsWorld dentro do app. Busque no YouTube e no SoundCloud ou cole link de mais de 1000 sites (yt-dlp, sem chave). Grave o que o PC está tocando. Arraste e solte arquivos, ou jogue direto na pasta do workspace.
 
 </td>
 <td valign="top">
 
 **GUARDAR**
 
-Workspaces são pastas comuns. Normalização de volume da biblioteca inteira, que liga e desliga. Estatísticas: plays, tempo tocado, ranking dos memes, gráfico de 14 dias e histórico. Modo portátil pra pendrive.
+Workspaces são pastas comuns. Normalização de volume da biblioteca inteira, que liga e desliga. Estatísticas: plays, tempo tocado, ranking dos memes, gráfico de 14 dias e histórico. Modo portátil pra pendrive. Busca pelo que é falado (offline, whisper.cpp). Ctrl+clique em vários pads de uma vez; apagar tem desfazer.
 
 </td>
 </tr>
@@ -140,6 +141,7 @@ Workspaces são pastas comuns. Normalização de volume da biblioteca inteira, q
 - [Compilando](#compilando)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Perguntas frequentes](#perguntas-frequentes)
+- [Segurança e privacidade](#segurança-e-privacidade)
 - [Créditos e licença](#créditos-e-licença)
 
 <br>
@@ -150,9 +152,11 @@ Cada versão na **[página de Releases](https://github.com/RshaCuDeVidro/WooferS
 
 | Arquivo | O que é |
 |---|---|
+| `WooferSoundPad-<versão>-windows-x86_64-setup.exe` | **Windows, instalador.** Atalhos no menu Iniciar e na área de trabalho, desinstala em Configurações > Aplicativos. Não pede administrador. |
 | `WooferSoundPad-<versão>-windows-x86_64.exe` | **Windows.** O app em si: um arquivo, dois cliques e pronto. |
 | `WooferSoundPad-<versão>-windows-x86_64-portable.zip` | **Windows, portátil.** Extraia onde quiser (até num pendrive): configurações, ferramentas e sons ficam na pasta. |
 | `WooferSoundPad-<versão>-windows-x86_64-compact.zip` | **Windows, compacto.** Só o `.exe`, comprimido pra menos da metade do tamanho, pra internet lenta. |
+| `WooferSoundPad-<versão>-linux-x86_64.deb` | **Debian, Ubuntu, Mint.** Dois cliques (ou `sudo apt install ./WooferSoundPad-*.deb`) e ele aparece no menu de apps. |
 | `WooferSoundPad-<versão>-linux-x86_64` | **Linux.** O app em si: `chmod +x` e rode. |
 | `WooferSoundPad-<versão>-linux-x86_64-compact` | **Linux, compacto.** O mesmo binário comprimido com UPX, cerca de um terço do tamanho; descomprime na memória ao abrir. |
 | `WooferSoundPad-<versão>-linux-x86_64.tar.gz` | **Linux, com instalador.** Põe no menu de apps com ícone: `./install.sh`. |
@@ -581,6 +585,18 @@ Os executáveis não são assinados, e programas pequenos sem assinatura que bai
 O WooferSoundPad é só um cliente e não hospeda nada. Esse conteúdo é dos donos e os termos dos sites valem. Respeite direitos autorais e use os downloads só pra você.
 
 </details>
+
+<br>
+
+## Segurança e privacidade
+
+O WooferSoundPad não tem conta, telemetria nem envio de erros. Configurações, estatísticas e sua biblioteca ficam no seu computador.
+
+A única requisição automática é a de atualização: ao abrir, e a cada 12 horas depois disso, o app pergunta à API do GitHub qual é a versão mais nova. Nada é baixado até você confirmar, e o download é conferido contra o `SHA256SUMS.txt` da versão antes de instalar. Configurações → Atualizações desliga a checagem.
+
+O resto só acontece quando você pede: o Explorar fala com MyInstants e SoundButtonsWorld, o YouTube e mais entrega o link pro yt-dlp, e as ferramentas opcionais (yt-dlp, FFmpeg, Deno) vêm dos releases delas no GitHub. O servidor de controle local vem desligado e escuta só em `127.0.0.1`, a não ser que você libere outros aparelhos.
+
+O [PRIVACY.md](PRIVACY.md) lista cada requisição (em inglês). Pra reportar uma vulnerabilidade, use o advisory privado do GitHub como descrito no [SECURITY.md](SECURITY.md), em vez de uma issue pública.
 
 <br>
 

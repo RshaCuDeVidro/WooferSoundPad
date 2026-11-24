@@ -371,6 +371,19 @@ pub const Manager = struct {
         return j;
     }
 
+    /// True while a job may still drop a file into this workspace's folder
+    pub fn busyIn(m: *const Manager, workspace_name: []const u8) bool {
+        for (m.jobs.items) |j| {
+            if (!std.mem.eql(u8, j.workspace_name, workspace_name)) continue;
+            switch (j.getState()) {
+                .queued, .running => return true,
+                .done => if (!j.handled) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     /// Starts queued jobs and returns finished ones that still need handling
     pub fn update(m: *Manager) ?*Job {
         var running: usize = 0;

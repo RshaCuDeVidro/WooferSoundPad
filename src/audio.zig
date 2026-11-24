@@ -99,6 +99,18 @@ pub fn setParams(id: c_int, p: Params) void {
     c.woof_set_params(id, p.trim_start, p.trim_end, @intFromBool(p.loop), p.speed, p.fade_in, p.fade_out);
 }
 
+/// Where a pad is heard: everywhere, only in your headphones, or only on the virtual mic
+pub const Route = enum { both, monitor, mic };
+
+pub fn setRoute(id: c_int, route: Route) void {
+    if (id < 0) return;
+    c.woof_set_route(id, switch (route) {
+        .both => c.WOOF_ROUTE_BOTH,
+        .monitor => c.WOOF_ROUTE_MONITOR,
+        .mic => c.WOOF_ROUTE_MIC,
+    });
+}
+
 /// Length of the whole file in seconds (the trim is ignored)
 pub fn fullLength(id: c_int) f32 {
     if (id < 0) return 0;
@@ -200,6 +212,34 @@ pub fn setFx(id: c_int, chain: *const fx.Chain) void {
     var buf: [fx.max]c.WoofFx = undefined;
     const n = chain.toC(&buf);
     c.woof_set_fx(id, &buf, n);
+}
+
+// ── Master bus ──────────────────────────────────────────────────────────────
+
+pub fn applyMaster(cfg: *const config.Config) void {
+    const m: c.WoofMaster = .{
+        .eq_low = cfg.master_eq_low,
+        .eq_mid = cfg.master_eq_mid,
+        .eq_high = cfg.master_eq_high,
+        .comp = cfg.master_comp,
+        .limiter = @intFromBool(cfg.master_limiter),
+    };
+    c.woof_set_master(&m);
+}
+
+pub fn setGlobalFx(chain: *const fx.Chain) void {
+    var buf: [fx.max]c.WoofFx = undefined;
+    const n = chain.toC(&buf);
+    c.woof_set_global_fx(&buf, n);
+}
+
+pub fn setGlobalFxOn(on: bool) void {
+    c.woof_set_global_fx_on(@intFromBool(on));
+}
+
+/// Writes [start, end) of a file as a 16-bit WAV; slow, call from a worker thread
+pub fn exportWav(path: [:0]const u8, start: f32, end: f32, rate: u32, channels: u8, out_path: [:0]const u8) bool {
+    return c.woof_export_wav(path.ptr, start, end, @intCast(rate), channels, out_path.ptr) == 0;
 }
 
 // ── Mixer ───────────────────────────────────────────────────────────────────

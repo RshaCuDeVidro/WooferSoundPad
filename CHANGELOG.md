@@ -3,6 +3,34 @@
 Every release is built and published by GitHub Actions from a `v*` tag. The
 section for that version below becomes the release notes.
 
+## [1.1.0] - 2026-10-24
+
+### Added
+
+- Updates inside the app: WooferSoundPad looks for a new release when it opens and asks before installing anything. One click downloads it, checks its SHA-256, makes sure it starts on your computer and restarts into the new version. Your sounds and settings stay. Can be turned off in Settings.
+- Linux install: one click (or `WooferSoundPad --install`) puts the app in your app menu with its icon in every size, quick actions (random sound, pause, stop all) and the right dock icon. No root needed, and it can be removed from Settings or with `--uninstall`.
+- Changelog tab in Settings, in English and Portuguese.
+- Master bus: a 3-band EQ, a compressor and a limiter on everything the pads play. The limiter is on by default, so pads playing together never clip.
+- Global effect: hold a key and a preset (Radio by default) goes over everything that plays; a switch keeps it on.
+- Output per pad: both, only you (headphones) or only the virtual mic, for cues the call never hears.
+- Pads that play by themselves, every N minutes or every day at a set time.
+- Several pads at once: Ctrl+click (or Ctrl+A), then change their volume, output or effects, star, move or delete them together.
+- Undo for deletes: a deleted pad goes to a trash with an Undo button (and Ctrl+Z), instead of a confirmation dialog.
+- Slice at silences: one long recording becomes a pad per piece, with the cuts shown on the waveform before anything is written.
+- Watched folders: files dropped into a workspace folder become pads right away, and pads whose file was deleted go away.
+- Search by speech (optional, offline): whisper.cpp transcribes each sound once, and the search finds a sound by what is said in it.
+- A QR code for the web deck in Settings: point your phone's camera at it.
+- Windows installer with Start menu and desktop shortcuts and an uninstaller in Settings > Apps, and a `.deb` for Debian, Ubuntu and Mint.
+
+### Fixed
+
+- Opening a dropdown (sort order, the workspace pickers) could crash the app, and choosing a language, sort order or audio device from a dropdown could have no effect.
+- Settings, and the changelog tab even more, were slow: drawing and wrapping text did far more work than needed.
+
+### Changed
+
+- The `install.sh` in the Linux tarball now runs the app's own installer, so both install the same way.
+
 ## [1.0.1] - 2026-10-24
 
 ### Fixed

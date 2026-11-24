@@ -41,6 +41,17 @@ pub const Config = struct {
     voice_volume: f32 = 1.0,
     voice_muted: bool = false,
 
+    // Master bus, on everything the pads play
+    master_eq_low: f32 = 0, // dB
+    master_eq_mid: f32 = 0,
+    master_eq_high: f32 = 0,
+    master_comp: f32 = 0, // 0 = off .. 1 = heavy
+    master_limiter: bool = true,
+    /// Effect laid over everything while its hotkey is held: "@3" is built-in
+    /// preset 3 (radio), anything else the name of a user preset
+    global_fx_preset: []const u8 = "@3",
+    global_fx_hotkey: []const u8 = "",
+
     // Queue
     queue_mode: bool = false, // clicking a pad adds it to the queue
     queue_repeat: bool = false,
@@ -54,6 +65,8 @@ pub const Config = struct {
     random_hotkey: []const u8 = "",
     mute_voice_hotkey: []const u8 = "",
     number_keys_play: bool = true,
+    /// Files dropped into a workspace folder show up as pads right away
+    watch_folders: bool = true,
 
     // Downloads
     ytdlp_path: []const u8 = "",
@@ -63,6 +76,10 @@ pub const Config = struct {
     normalize_audio: bool = true,
     max_clip_seconds: u32 = 0,
     results_per_search: u32 = 20,
+
+    // Search by what is said: whisper.cpp transcribes each sound once
+    transcribe: bool = false,
+    whisper_path: []const u8 = "",
 
     // Effects: presets saved by the user (built-ins live in fx.zig)
     fx_presets: []const fx.UserPreset = &.{},
@@ -86,6 +103,11 @@ pub const Config = struct {
     http_port: u16 = 8737,
     http_lan: bool = false,
     http_token: []const u8 = "",
+
+    // Updates: look for a new release when the app opens
+    update_check: bool = true,
+    update_skip: []const u8 = "", // a version the user chose to skip
+    install_prompted: bool = false, // Linux: asked once about the app menu
 
     // Statistics page
     stats_all_workspaces: bool = true,
@@ -149,6 +171,10 @@ fn sanitize(cfg_in: Config) Config {
     cfg.results_per_search = std.math.clamp(cfg.results_per_search, 5, 50);
     cfg.mixer_fade_seconds = std.math.clamp(cfg.mixer_fade_seconds, 0.2, 10);
     cfg.normalize_target = std.math.clamp(cfg.normalize_target, -30, -8);
+    cfg.master_eq_low = std.math.clamp(cfg.master_eq_low, -12, 12);
+    cfg.master_eq_mid = std.math.clamp(cfg.master_eq_mid, -12, 12);
+    cfg.master_eq_high = std.math.clamp(cfg.master_eq_high, -12, 12);
+    cfg.master_comp = std.math.clamp(cfg.master_comp, 0, 1);
     cfg.window_width = @max(cfg.window_width, 960);
     cfg.window_height = @max(cfg.window_height, 600);
     return cfg;

@@ -61,6 +61,7 @@ fn drawOverlays(a: *App) void {
         .pad => soundboard.drawPadMenu(a, m),
         .workspace => drawWorkspaceMenu(a, m),
     };
+    if (a.page == .soundboard and !a.stage) soundboard.drawBulkMenu(a);
     dialogs.draw(a);
     onboarding.draw(a);
     ui.drawDropdownPopup();

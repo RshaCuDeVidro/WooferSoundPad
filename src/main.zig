@@ -10,6 +10,8 @@ const ui = @import("ui.zig");
 const ipc = @import("ipc.zig");
 const view = @import("view.zig");
 const devtools = @import("devtools.zig");
+const updater = @import("update.zig");
+const desktop = @import("desktop.zig");
 const App = @import("app.zig").App;
 
 const usage =
@@ -26,6 +28,8 @@ const usage =
     \\  WooferSoundPad --mute-voice        mute / unmute your voice on the virtual mic
     \\  WooferSoundPad --workspace "<name>" switch workspace
     \\  WooferSoundPad --show              bring the window to the front
+    \\  WooferSoundPad --install          add it to the app menu with its icon (Linux)
+    \\  WooferSoundPad --uninstall        remove it from the app menu (Linux)
     \\  WooferSoundPad --version
     \\
     \\Remote control (--play, --stop, ...) is available on Linux, so Wayland users
@@ -48,6 +52,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     sys.detectPortable();
+    updater.init();
+    // Runs last, after the window, audio and IPC socket are gone
+    defer updater.relaunchIfPending();
     var app: App = .{ .cfg = config.load() };
 
     c.SetTraceLogLevel(c.LOG_ERROR);
@@ -130,6 +137,10 @@ fn handleCli(args: []const [:0]const u8) !bool {
         std.debug.print("WooferSoundPad {s}\n", .{build_options.version});
         return true;
     }
+    if (std.mem.eql(u8, cmd, "--install") or std.mem.eql(u8, cmd, "--uninstall")) {
+        desktopCli(std.mem.eql(u8, cmd, "--install"));
+        return true;
+    }
     var line_buf: [512]u8 = undefined;
     const line: ?[]const u8 = if (std.mem.eql(u8, cmd, "--play"))
         try std.fmt.bufPrint(&line_buf, "play {s}", .{arg})
@@ -165,4 +176,46 @@ fn handleCli(args: []const [:0]const u8) !bool {
         std.process.exit(1);
     }
     return true;
+}
+
+fn desktopCli(install: bool) void {
+    if (!desktop.supported) {
+        std.debug.print("--install and --uninstall are for Linux. On Windows just run the .exe.\n", .{});
+        std.process.exit(1);
+    }
+    sys.detectPortable();
+    if (!install) {
+        desktop.uninstall() catch |err| {
+            std.debug.print("Could not uninstall: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.debug.print(
+            \\WooferSoundPad was removed from the app menu.
+            \\Your sounds and settings were kept. Delete them by hand if you want:
+            \\  ~/Music/WooferSoundPad  ~/.config/WooferSoundPad  ~/.local/share/WooferSoundPad
+            \\
+        , .{});
+        return;
+    }
+    const res = desktop.install() catch |err| {
+        std.debug.print("Could not install: {s}\n", .{@errorName(err)});
+        if (err == error.AccessDenied) std.debug.print("For a system-wide install run: sudo PREFIX=/usr/local WooferSoundPad --install\n", .{});
+        std.process.exit(1);
+    };
+    defer sys.gpa.free(res.exe);
+    std.debug.print("WooferSoundPad {s} installed: {s}\n", .{ build_options.version, res.exe });
+    std.debug.print("It is in your app menu now, with its icon. Remove it with: WooferSoundPad --uninstall\n", .{});
+    const dir = std.fs.path.dirname(res.exe) orelse "";
+    const path = sys.getenv("PATH") orelse "";
+    var it = std.mem.tokenizeScalar(u8, path, ':');
+    while (it.next()) |p| {
+        if (std.mem.eql(u8, p, dir)) break;
+    } else std.debug.print("note: {s} is not on your PATH. Add it to use 'WooferSoundPad --play ...' in shortcuts.\n", .{dir});
+    for ([_][]const u8{ "curl", "pactl" }) |tool| {
+        const found = sys.which(tool) orelse {
+            std.debug.print("note: '{s}' was not found. Install it for the full experience (see the README).\n", .{tool});
+            continue;
+        };
+        sys.gpa.free(found);
+    }
 }

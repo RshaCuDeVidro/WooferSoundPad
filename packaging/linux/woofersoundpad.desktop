@@ -1,18 +1,32 @@
 [Desktop Entry]
 Type=Application
-Version=1.0
+Version=1.5
 Name=WooferSoundPad
 GenericName=Soundboard
-Comment=A blazing-fast soundboard for Linux & Windows
-Comment[pt_BR]=Um soundboard ultrarrápido para Linux e Windows
+GenericName[pt_BR]=Mesa de sons
+Comment=Play sounds through your microphone in Discord, games and streams
+Comment[pt_BR]=Toque sons no seu microfone no Discord, em jogos e em lives
+TryExec=WooferSoundPad
 Exec=WooferSoundPad
 Icon=woofersoundpad
 Terminal=false
-Categories=AudioVideo;Audio;
-Keywords=soundboard;sound;meme;discord;microphone;audio;
+Categories=AudioVideo;Audio;Mixer;
+Keywords=soundboard;sound;sfx;meme;discord;microphone;mic;stream;obs;
+Keywords[pt_BR]=soundboard;som;efeito;meme;discord;microfone;mic;live;obs;
 StartupNotify=true
 StartupWMClass=WooferSoundPad
-Actions=stop-all;
+SingleMainWindow=true
+Actions=random;pause;stop-all;
+
+[Desktop Action random]
+Name=Play a random sound
+Name[pt_BR]=Tocar um som aleatório
+Exec=WooferSoundPad --random
+
+[Desktop Action pause]
+Name=Pause or resume
+Name[pt_BR]=Pausar ou continuar
+Exec=WooferSoundPad --pause
 
 [Desktop Action stop-all]
 Name=Stop all sounds

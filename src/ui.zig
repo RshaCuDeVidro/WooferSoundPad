@@ -147,6 +147,10 @@ var blocker_next_count: usize = 0;
 
 var clip_stack: [16]Rect = undefined;
 var clip_depth: usize = 0;
+/// Sum of the active pushTranslate offsets; clips stay in untranslated space
+var translation: Vec2 = .{};
+var translate_stack: [8]Vec2 = undefined;
+var translate_depth: usize = 0;
 
 var alpha_stack: [16]f32 = undefined;
 var alpha_depth: usize = 0;
@@ -259,6 +263,47 @@ fn initCodepoints() void {
     }
     text_codepoint_count = n;
     for (icons.all, 0..) |icon_cp, i| icon_codepoints[i] = @intCast(icon_cp);
+    // raylib keeps the glyphs in the order asked for, so sorted lists let
+    // glyphIndex bisect
+    std.mem.sort(c_int, text_codepoints[0..n], {}, std.sort.asc(c_int));
+    std.mem.sort(c_int, &icon_codepoints, {}, std.sort.asc(c_int));
+}
+
+/// Glyph slot of `cp`, or of '?' when the font lacks it (like GetGlyphIndex,
+/// which scans every glyph and made long text crawl)
+fn glyphIndex(f: c.Font, cp: u21) usize {
+    return findGlyph(f, cp) orelse findGlyph(f, '?') orelse 0;
+}
+
+fn findGlyph(f: c.Font, cp: u21) ?usize {
+    if (f.glyphCount <= 0) return null;
+    const glyphs = f.glyphs[0..@intCast(f.glyphCount)];
+    const want: c_int = @intCast(cp);
+    var lo: usize = 0;
+    var hi: usize = glyphs.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const v = glyphs[mid].value;
+        if (v == want) return mid;
+        if (v < want) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+/// DrawTextCodepoint for a glyph that is already looked up
+fn drawGlyph(f: c.Font, gi: usize, pos: Vec2, size: f32, col: c.Color) void {
+    const k = size / @as(f32, @floatFromInt(f.baseSize));
+    const pad: f32 = @floatFromInt(f.glyphPadding);
+    const g = f.glyphs[gi];
+    const rec = f.recs[gi];
+    const src: c.Rectangle = .{ .x = rec.x - pad, .y = rec.y - pad, .width = rec.width + 2 * pad, .height = rec.height + 2 * pad };
+    const dst: c.Rectangle = .{
+        .x = pos.x + (@as(f32, @floatFromInt(g.offsetX)) - pad) * k,
+        .y = pos.y + (@as(f32, @floatFromInt(g.offsetY)) - pad) * k,
+        .width = src.width * k,
+        .height = src.height * k,
+    };
+    c.DrawTexturePro(f.texture, src, dst, .{ .x = 0, .y = 0 }, 0, col);
 }
 
 /// UI sizes are close to CSS em sizes; raylib sizes are full line heights
@@ -373,6 +418,8 @@ pub fn deinit() void {
     c.UnloadShader(shader);
     anims.deinit(gpa);
     fonts.deinit(gpa);
+    dropdown_text.deinit(gpa);
+    dropdown_items.deinit(gpa);
 }
 
 pub fn beginFrame() void {
@@ -589,11 +636,26 @@ pub fn pushTranslate(dx: f32, dy: f32) void {
     c.rlDrawRenderBatchActive();
     c.rlPushMatrix();
     c.rlTranslatef(dx, dy, 0);
+    translate_stack[translate_depth] = translation;
+    translate_depth += 1;
+    translation = .{ .x = translation.x + dx, .y = translation.y + dy };
 }
 
 pub fn popTranslate() void {
     c.rlDrawRenderBatchActive();
     c.rlPopMatrix();
+    translate_depth -= 1;
+    translation = translate_stack[translate_depth];
+}
+
+/// True when `r` lands wholly outside the clip, so drawing it is wasted work
+/// (Settings draws every section, scrolled into view or not)
+fn culled(r: Rect) bool {
+    if (clip_depth == 0) return false;
+    const cl = clip_stack[clip_depth - 1];
+    const x = r.x + translation.x;
+    const y = r.y + translation.y;
+    return x >= cl.right() or x + r.w <= cl.x or y >= cl.bottom() or y + r.h <= cl.y;
 }
 
 // ── Drawing primitives ──────────────────────────────────────────────────────
@@ -625,6 +687,7 @@ fn sdfQuad(r: Rect, radius: f32, soft: f32, thickness: f32, corners: Corners, te
     const y0 = r.y - pad;
     const x1 = r.right() + pad;
     const y1 = r.bottom() + pad;
+    if (culled(.{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 })) return;
 
     if (texture) |tex| c.rlSetTexture(tex.id) else c.rlSetTexture(c.rlGetTextureIdDefault());
     c.rlBegin(c.RL_QUADS);
@@ -747,10 +810,7 @@ pub fn measure(str: []const u8, size: f32, kind: FontKind) f32 {
     const k = lineSize(kind, size) / @as(f32, @floatFromInt(f.baseSize));
     var w: f32 = 0;
     var it: Utf8Iter = .{ .s = str };
-    while (it.next()) |cp| {
-        const gi: usize = @intCast(c.GetGlyphIndex(f, @intCast(cp)));
-        w += glyphAdvance(f, gi) * k;
-    }
+    while (it.next()) |cp| w += glyphAdvance(f, glyphIndex(f, cp)) * k;
     return w;
 }
 
@@ -760,14 +820,16 @@ pub fn text(str: []const u8, x: f32, y_in: f32, size_in: f32, kind: FontKind, co
     const size = lineSize(kind, size_in);
     // Keep the glyphs centered on the box callers think they are drawing in
     const y = y_in - (size - size_in) / 2;
+    // A line outside the clip only needs its width
+    if (culled(.{ .x = x, .y = y - 2, .w = 1e6, .h = size + 4 })) return measure(str, size_in, kind);
     const k = size / @as(f32, @floatFromInt(f.baseSize));
     const cc = toColor(col);
     var pen = x;
     var it: Utf8Iter = .{ .s = str };
     while (it.next()) |cp| {
-        const gi: usize = @intCast(c.GetGlyphIndex(f, @intCast(cp)));
+        const gi = glyphIndex(f, cp);
         if (cp != ' ' and cp != '\t' and cc.a > 0) {
-            c.DrawTextCodepoint(f, @intCast(cp), .{ .x = snap(pen), .y = snap(y) }, size, cc);
+            drawGlyph(f, gi, .{ .x = snap(pen), .y = snap(y) }, size, cc);
         }
         pen += glyphAdvance(f, gi) * k;
     }
@@ -809,8 +871,7 @@ fn fitEllipsis(str: []const u8, max_w: f32, size: f32, kind: FontKind) []const u
     var it: Utf8Iter = .{ .s = str };
     var last: usize = 0;
     while (it.next()) |cp| {
-        const gi: usize = @intCast(c.GetGlyphIndex(f, @intCast(cp)));
-        w += glyphAdvance(f, gi) * k;
+        w += glyphAdvance(f, glyphIndex(f, cp)) * k;
         if (w > budget) break;
         last = it.i;
     }
@@ -824,14 +885,16 @@ pub fn paragraph(str: []const u8, r: Rect, size: f32, kind: FontKind, col: Rgba,
     while (lines.next()) |para| {
         var start: usize = 0;
         while (start <= para.len) {
-            // Greedily take words while they fit
+            // Greedily take words while they fit, measuring each word once
             var end = start;
             var best = start;
+            var line_w: f32 = 0;
             while (end < para.len) {
                 var next_end = end;
                 while (next_end < para.len and para[next_end] == ' ') next_end += 1;
                 while (next_end < para.len and para[next_end] != ' ') next_end += 1;
-                if (measure(para[start..next_end], size, kind) > r.w and best > start) break;
+                line_w += measure(para[end..next_end], size, kind);
+                if (line_w > r.w and best > start) break;
                 best = next_end;
                 end = next_end;
             }
@@ -847,15 +910,16 @@ pub fn paragraph(str: []const u8, r: Rect, size: f32, kind: FontKind, col: Rgba,
 }
 
 pub fn icon(cp: u21, center: Vec2, size: f32, col: Rgba) void {
+    if (culled(.{ .x = center.x - size, .y = center.y - size, .w = size * 2, .h = size * 2 })) return;
     const f = font(.icon, size);
     const k = size / @as(f32, @floatFromInt(f.baseSize));
-    const gi: usize = @intCast(c.GetGlyphIndex(f, @intCast(cp)));
+    const gi = glyphIndex(f, cp);
     const g = f.glyphs[gi];
     const rec = f.recs[gi];
     // Center the glyph's ink box, not its advance box
     const ink_x = @as(f32, @floatFromInt(g.offsetX)) * k + rec.width * k / 2;
     const ink_y = @as(f32, @floatFromInt(g.offsetY)) * k + rec.height * k / 2;
-    c.DrawTextCodepoint(f, @intCast(cp), .{ .x = snap(center.x - ink_x), .y = snap(center.y - ink_y) }, size, toColor(col));
+    drawGlyph(f, gi, .{ .x = snap(center.x - ink_x), .y = snap(center.y - ink_y) }, size, toColor(col));
 }
 
 pub fn iconIn(cp: u21, r: Rect, size: f32, col: Rgba) void {
@@ -1487,11 +1551,16 @@ const Toast = struct {
     life: f32,
     y: f32,
     key: u64,
+    /// Optional button ("Undo") and what `takenAction` reports when it is clicked
+    action: [32]u8 = undefined,
+    action_len: usize = 0,
+    action_id: u64 = 0,
 };
 
 var toasts: [6]Toast = undefined;
 var toast_count: usize = 0;
 var toast_serial: u64 = 0;
+var toast_taken: ?u64 = null;
 
 pub fn toast(kind: ToastKind, msg: []const u8) void {
     if (toast_count == toasts.len) {
@@ -1504,6 +1573,29 @@ pub fn toast(kind: ToastKind, msg: []const u8) void {
     t.key = id("toast", toast_serial);
     toasts[toast_count] = t;
     toast_count += 1;
+}
+
+/// A toast with a button, e.g. "Undo". `takenAction` returns `action_id`
+/// once, on the frame after the button was clicked.
+pub fn toastAction(kind: ToastKind, msg: []const u8, action: []const u8, action_id: u64, life: f32) void {
+    toast(kind, msg);
+    const t = &toasts[toast_count - 1];
+    t.action_len = @min(action.len, t.action.len);
+    @memcpy(t.action[0..t.action_len], action[0..t.action_len]);
+    t.action_id = action_id;
+    t.life = life;
+}
+
+pub fn takenAction() ?u64 {
+    defer toast_taken = null;
+    return toast_taken;
+}
+
+/// Drops the toast carrying this action (its undo no longer applies)
+pub fn dismissAction(action_id: u64) void {
+    for (toasts[0..toast_count]) |*t| {
+        if (t.action_len > 0 and t.action_id == action_id) t.life = @min(t.life, time - t.born);
+    }
 }
 
 pub fn toastFmt(kind: ToastKind, comptime fmt: []const u8, args: anytype) void {
@@ -1534,7 +1626,9 @@ pub fn drawToasts() void {
         const in_t = easeOutCubic(std.math.clamp(age / 0.25, 0, 1));
         const out_t = std.math.clamp((age - t.life) / 0.35, 0, 1);
         const s = t.msg[0..t.len];
-        const w = @min(420, measure(s, 13, .semibold) + 70);
+        const act = t.action[0..t.action_len];
+        const act_w: f32 = if (act.len > 0) measure(act, 12, .semibold) + 28 else 0;
+        const w = @min(420 + act_w, measure(s, 13, .semibold) + 70 + act_w);
         const h: f32 = 48;
         y -= h + 10;
         if (t.y < 0) t.y = y;
@@ -1560,7 +1654,11 @@ pub fn drawToasts() void {
         border(r, radius_md, 1, colors.border);
         rect(.{ .x = r.x, .y = r.y, .w = 3, .h = r.h }, 0, accent_col);
         icon(ic, .{ .x = r.x + 24, .y = r.y + 24 }, 15, accent_col);
-        label(s, .{ .x = r.x + 44, .y = r.y, .w = r.w - 56, .h = r.h }, 13, .semibold, colors.text, .left);
+        label(s, .{ .x = r.x + 44, .y = r.y, .w = r.w - 56 - act_w, .h = r.h }, 13, .semibold, colors.text, .left);
+        if (act.len > 0 and button(sub(t.key, 1), .{ .x = r.right() - act_w - 8, .y = r.y + 9, .w = act_w, .h = 30 }, act, .{ .style = .ghost, .size = 12 })) {
+            toast_taken = t.action_id;
+            t.life = @min(t.life, age);
+        }
         // Lifetime bar
         const life_left = std.math.clamp(1 - age / t.life, 0, 1);
         rect(.{ .x = r.x + 3, .y = r.bottom() - 2, .w = (r.w - 3) * life_left, .h = 2 }, 0, accent_col.alpha(0.5));
@@ -1603,32 +1701,45 @@ pub fn endModal() void {
 
 // ── Dropdown (popup drawn at the end of the frame) ──────────────────────────
 
+// The popup is drawn after the widget's caller has returned, and callers pass
+// items and `selected` that live on their stack. So the popup keeps its own
+// copy of the labels and hands the pick back through `dropdown` next frame.
 const DropdownPopup = struct {
     key: u64,
     anchor: Rect,
-    items: []const []const u8,
-    selected: *usize,
+    selected: usize,
     layer: u8,
-    changed: bool = false,
+    /// Set by `dropdown` every frame; the popup closes when its widget is gone
+    seen: bool = true,
 };
 
 var dropdown_open: ?DropdownPopup = null;
-var dropdown_changed_key: u64 = 0;
+var dropdown_pick: ?struct { key: u64, index: usize } = null;
+var dropdown_text: std.ArrayList(u8) = .empty;
+var dropdown_items: std.ArrayList([]const u8) = .empty;
 
 pub fn dropdown(key: u64, r: Rect, items: []const []const u8, selected: *usize) bool {
-    const changed = dropdown_changed_key == key;
-    if (changed) dropdown_changed_key = 0;
+    var changed = false;
+    if (dropdown_pick) |pick| {
+        if (pick.key == key) {
+            dropdown_pick = null;
+            if (pick.index < items.len) {
+                selected.* = pick.index;
+                changed = true;
+            }
+        }
+    }
     const is_open = if (dropdown_open) |p| p.key == key else false;
     const in = interact(key, r);
     if (in.clicked) {
-        dropdown_open = if (is_open) null else .{ .key = key, .anchor = r, .items = items, .selected = selected, .layer = layer };
+        dropdown_open = if (is_open) null else .{ .key = key, .anchor = r, .selected = selected.*, .layer = layer };
     }
     if (dropdown_open) |*p| {
         if (p.key == key) {
-            // Keep pointers fresh: the caller's data may have moved
             p.anchor = r;
-            p.items = items;
-            p.selected = selected;
+            p.selected = selected.*;
+            p.seen = true;
+            copyDropdownItems(items);
         }
     }
     const open_t = anim(sub(key, 9), if (is_open) 1 else 0, 18);
@@ -1642,8 +1753,25 @@ pub fn dropdown(key: u64, r: Rect, items: []const []const u8, selected: *usize) 
     return changed;
 }
 
+fn copyDropdownItems(items: []const []const u8) void {
+    dropdown_text.clearRetainingCapacity();
+    dropdown_items.clearRetainingCapacity();
+    for (items) |item| dropdown_text.appendSlice(gpa, item) catch return;
+    // Sliced only once the text buffer has stopped growing
+    var off: usize = 0;
+    for (items) |item| {
+        dropdown_items.append(gpa, dropdown_text.items[off..][0..item.len]) catch return;
+        off += item.len;
+    }
+}
+
 pub fn drawDropdownPopup() void {
     const p = &(dropdown_open orelse return);
+    if (!p.seen) {
+        dropdown_open = null;
+        return;
+    }
+    p.seen = false;
     const saved_layer = layer;
     layer = p.layer + 1;
     defer layer = saved_layer;
@@ -1651,7 +1779,8 @@ pub fn drawDropdownPopup() void {
     const t = animFrom(sub(p.key, 10), 0, 1, 18);
     const item_h: f32 = 32;
     const max_visible: f32 = 9;
-    const n: f32 = @floatFromInt(p.items.len);
+    const items = dropdown_items.items;
+    const n: f32 = @floatFromInt(items.len);
     const h = @min(n, max_visible) * item_h + 8;
     var r: Rect = .{ .x = p.anchor.x, .y = p.anchor.bottom() + 6, .w = @max(p.anchor.w, 180), .h = h };
     if (r.bottom() > screen.h - 10) r.y = p.anchor.y - 6 - h;
@@ -1665,17 +1794,16 @@ pub fn drawDropdownPopup() void {
 
     const inner = shown.inset(4);
     var y = beginScroll(sub(p.key, 11), inner);
-    for (p.items, 0..) |item, i| {
+    for (items, 0..) |item, i| {
         const row: Rect = .{ .x = inner.x, .y = y, .w = inner.w, .h = item_h };
         const in = interact(sub(p.key, 1000 + i), row);
-        const sel = i == p.selected.*;
+        const sel = i == p.selected;
         if (sel) rect(.{ .x = row.x, .y = row.y + 8, .w = 2, .h = row.h - 16 }, 1, colors.accent);
         rect(row, radius_sm, colors.text.alpha(in.hover_t * 0.06));
         label(item, .{ .x = row.x + 10, .y = row.y, .w = row.w - 36, .h = row.h }, 13, if (sel) .semibold else .regular, if (sel) colors.accent else colors.text, .left);
         if (sel) icon(icons.check, .{ .x = row.right() - 16, .y = row.y + row.h / 2 }, 14, colors.accent);
         if (in.clicked) {
-            p.selected.* = i;
-            dropdown_changed_key = p.key;
+            dropdown_pick = .{ .key = p.key, .index = i };
             dropdown_open = null;
             endScroll(n * item_h);
             return;

@@ -149,6 +149,29 @@ pub fn pressedLocal(hk: Hotkey) bool {
     return @as(u4, @bitCast(currentMods())) == @as(u4, @bitCast(hk.mods));
 }
 
+/// Whether the hotkey's key is physically down right now, whichever window
+/// has focus: for actions that last while the key is held
+pub fn isDown(hk: Hotkey, window_focused: bool) bool {
+    if (window_focused) return c.IsKeyDown(hk.key);
+    const info = infoFor(hk.key) orelse return false;
+    if (builtin.os.tag == .windows) return win.GetAsyncKeyState(@intCast(info.vk)) < 0;
+    return x11Down(info.x11);
+}
+
+/// A connection of the UI thread's own (the hotkey thread keeps the other)
+var query_display: ?*x11.Display = null;
+
+fn x11Down(keysym: u32) bool {
+    if (builtin.os.tag == .windows) return false;
+    if (query_display == null) query_display = x11.XOpenDisplay(null);
+    const dpy = query_display orelse return false;
+    const code = x11.XKeysymToKeycode(dpy, keysym);
+    if (code == 0) return false;
+    var keys: [32]u8 = undefined;
+    _ = x11.XQueryKeymap(dpy, &keys);
+    return keys[code / 8] & (@as(u8, 1) << @intCast(code % 8)) != 0;
+}
+
 /// Hotkey capture for the editor: returns a combo once a non-modifier key is pressed
 pub fn capture() ?Hotkey {
     var key = c.GetKeyPressed();
@@ -266,6 +289,7 @@ const win = struct {
     extern "user32" fn RegisterHotKey(hwnd: ?*anyopaque, id: c_int, mods: c_uint, vk: c_uint) callconv(.winapi) c_int;
     extern "user32" fn UnregisterHotKey(hwnd: ?*anyopaque, id: c_int) callconv(.winapi) c_int;
     extern "user32" fn PeekMessageW(msg: *MSG, hwnd: ?*anyopaque, min: c_uint, max: c_uint, remove: c_uint) callconv(.winapi) c_int;
+    extern "user32" fn GetAsyncKeyState(vk: c_int) callconv(.winapi) i16;
     const WM_HOTKEY = 0x0312;
     const PM_REMOVE = 1;
     const MOD_ALT = 1;
@@ -347,6 +371,7 @@ const x11 = struct {
     extern "X11" fn XNextEvent(d: *Display, ev: *XEvent) c_int;
     extern "X11" fn XSync(d: *Display, discard: c_int) c_int;
     extern "X11" fn XSetErrorHandler(handler: ?ErrorHandler) ?ErrorHandler;
+    extern "X11" fn XQueryKeymap(d: *Display, keys: *[32]u8) c_int;
     const ShiftMask = 1;
     const LockMask = 2;
     const ControlMask = 4;

@@ -12,6 +12,8 @@ const view = @import("view.zig");
 const waves = @import("waves.zig");
 const library = @import("library.zig");
 const mixer = @import("view_mixer.zig");
+const fx = @import("fx.zig");
+const schedule = @import("schedule.zig");
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const icons = ui.icons;
@@ -23,13 +25,17 @@ var shown_generation: u32 = std.math.maxInt(u32);
 pub var debug_more_rect: Rect = .{};
 var shown_at: f32 = 0;
 
+/// Menu opened from the selection bar (drawn with the other overlays)
+pub var bulk_menu: ?struct { kind: enum { output, fx, move }, pos: ui.Vec2 } = null;
+
 pub fn rebuildView(a: *App) void {
     const ws = a.workspace();
     a.view.clearRetainingCapacity();
     const q = std.mem.trim(u8, a.search.text(), " ");
     for (ws.sounds.items, 0..) |s, i| {
         if (a.favorites_only and !s.favorite) continue;
-        if (q.len > 0 and std.ascii.findIgnoreCase(s.name, q) == null) continue;
+        // The search also finds what is said in a sound (once transcribed)
+        if (q.len > 0 and std.ascii.findIgnoreCase(s.name, q) == null and std.ascii.findIgnoreCase(s.transcript, q) == null) continue;
         a.view.append(sys.gpa, i) catch return;
     }
     const Ctx = struct {
@@ -189,6 +195,13 @@ pub fn draw(a: *App, area: Rect) void {
     }
     if (search_r.w >= 40) _ = ui.textInput(ui.id("pad-search", 0), search_r, &a.search, .{ .placeholder = if (search_r.w < 150) "" else a.t.search_sounds, .icon = icons.search, .size = 13 });
 
+    // ── Selection bar (Ctrl+click on pads) ──
+    pruneSelection(a);
+    if (a.selection.items.len > 0) {
+        bulkBar(a, r.cutTop(40));
+        _ = r.cutTop(12);
+    } else bulk_menu = null;
+
     // ── Body ──
     if (ws.sounds.items.len == 0) {
         const actions = view.emptyState(r, icons.paw_print, a.t.empty_title, a.t.empty_body);
@@ -257,6 +270,7 @@ fn drawPad(a: *App, si: usize, order: usize, r: Rect) void {
     const playing = audio.isPlaying(s.audio_id);
     const paused = !playing and audio.isPaused(s.audio_id);
     const play_t = ui.anim(ui.sub(key, 40), if (playing) 1 else if (paused) 0.5 else 0, 14);
+    const sel_t = ui.anim(ui.sub(key, 42), if (a.isSelected(s.uid)) 1 else 0, 18);
     const col = theme.padColor(s.color, ui.colors.accent);
     const pr = r.offset(0, in.press_t * 1.5);
 
@@ -288,6 +302,10 @@ fn drawPad(a: *App, si: usize, order: usize, r: Rect) void {
     ui.popClip();
 
     if (a.cfg.show_waveforms) padWaveform(ws, s, pr, col, play_t, hover_t);
+    if (sel_t > 0.01) {
+        ui.rect(pr, ui.radius_lg, ui.colors.accent.alpha(0.1 * sel_t));
+        ui.border(pr.grow(2), ui.radius_lg + 2, 2, ui.colors.accent.alpha(sel_t));
+    }
 
     // Top row: number or hotkey, tags, LED and the "more" button
     var hint_buf: [32]u8 = undefined;
@@ -299,6 +317,12 @@ fn drawPad(a: *App, si: usize, order: usize, r: Rect) void {
         std.fmt.bufPrint(&hint_buf, "{d:0>2}", .{order + 1}) catch "";
     const top_y = pr.y + 9;
     var tx = pr.x + 11;
+    if (sel_t > 0.01) {
+        const ck: ui.Vec2 = .{ .x = tx + 6, .y = top_y + 6 };
+        ui.circle(ck, 7 * ui.easeOutBack(sel_t), ui.colors.accent);
+        ui.icon(icons.check, ck, 9 * sel_t, ui.colors.accent_text);
+        tx += 18 * sel_t;
+    }
     if (a.cfg.show_hotkeys_on_pads or s.hotkey.len == 0) {
         tx += ui.text(hint, tx, top_y, 11, if (s.hotkey.len > 0) .mono_bold else .mono, if (s.hotkey.len > 0) col else ui.colors.text_faint) + 8;
     }
@@ -326,8 +350,8 @@ fn drawPad(a: *App, si: usize, order: usize, r: Rect) void {
         ui.popAlpha();
     }
     // Tags, right to left: what changes how this pad plays
-    var tag_buf: [6][12]u8 = undefined;
-    var tags: [6][]const u8 = undefined;
+    var tag_buf: [8][12]u8 = undefined;
+    var tags: [8][]const u8 = undefined;
     var n_tags: usize = 0;
     const n_fx = s.fx.active();
     if (n_fx > 0) {
@@ -349,6 +373,17 @@ fn drawPad(a: *App, si: usize, order: usize, r: Rect) void {
     }
     if (ws.fileUsers(s.file) > 1) {
         tags[n_tags] = "VAR";
+        n_tags += 1;
+    }
+    if (s.output != .both) {
+        tags[n_tags] = if (s.output == .monitor) "MON" else "MIC";
+        n_tags += 1;
+    }
+    if (s.schedule_every > 0) {
+        tags[n_tags] = std.fmt.bufPrint(&tag_buf[n_tags], "{d}M", .{s.schedule_every}) catch "";
+        n_tags += 1;
+    } else if (s.schedule_at >= 0) {
+        tags[n_tags] = schedule.formatTime(&tag_buf[n_tags], s.schedule_at);
         n_tags += 1;
     }
     if (a.queuePosition(s.uid)) |qi| {
@@ -386,11 +421,16 @@ fn drawPad(a: *App, si: usize, order: usize, r: Rect) void {
         ui.rect(.{ .x = pr.x + 1, .y = pr.bottom() - 3, .w = (pr.w - 2) * p, .h = 2 }, 0, col.alpha(play_t));
     }
 
-    // Input: Shift+click always queues
+    // Input: Ctrl+click selects, Shift+click always queues
     if (in.clicked) {
+        const ctrl = c.IsKeyDown(c.KEY_LEFT_CONTROL) or c.IsKeyDown(c.KEY_RIGHT_CONTROL);
         const shift = c.IsKeyDown(c.KEY_LEFT_SHIFT) or c.IsKeyDown(c.KEY_RIGHT_SHIFT);
-        if (shift) a.enqueue(si) else a.playSound(si);
-        a.addRipple(si, ui.mouse.x, ui.mouse.y);
+        if (ctrl) {
+            a.toggleSelected(s.uid);
+        } else {
+            if (shift) a.enqueue(si) else a.playSound(si);
+            a.addRipple(si, ui.mouse.x, ui.mouse.y);
+        }
     }
     if (in.right_clicked) a.menu = .{ .kind = .pad, .index = si, .pos = ui.mouse };
     if (in.hovered and s.source.len > 0) ui.tooltip(key, s.name);
@@ -410,8 +450,8 @@ pub fn drawPadMenu(a: *App, m: app_mod.MenuState) void {
     const playing = audio.isPlaying(s.audio_id);
     const paused = audio.isPaused(s.audio_id);
     const extra: usize = if (playing or paused) 1 else 0;
-    // header + play + (pause) + queue | edit, effects, variant, hotkey | favorite, duplicate, folder | (moves) | delete
-    const rows = 1 + 2 + extra + 4 + 3 + (if (moves > 0) moves + 1 else 0) + 1;
+    // header + play + (pause) + queue | edit, effects, variant, slice, hotkey | favorite, select, duplicate, folder | (moves) | delete
+    const rows = 1 + 2 + extra + 5 + 4 + (if (moves > 0) moves + 1 else 0) + 1;
     const seps: usize = 3 + (if (moves > 0) @as(usize, 1) else 0);
     var menu = ui.beginMenuW(ui.id("pad-menu", m.index), m.pos, rows, seps, 240);
     var close = false;
@@ -447,6 +487,10 @@ pub fn drawPadMenu(a: *App, m: app_mod.MenuState) void {
         a.createVariant(m.index, null);
         close = true;
     }
+    if (menu.item(icons.audio_waveform, a.t.slice_menu, false)) {
+        a.openSlicer(m.index);
+        close = true;
+    }
     if (menu.itemHint(icons.keyboard, a.t.set_hotkey, s.hotkey, false)) {
         a.openEditor(m.index);
         a.editor.tab = .pad;
@@ -457,6 +501,10 @@ pub fn drawPadMenu(a: *App, m: app_mod.MenuState) void {
     if (menu.item(icons.star, if (s.favorite) a.t.unfavorite else a.t.favorite, false)) {
         s.favorite = !s.favorite;
         a.lib.save(a.ws) catch {};
+        close = true;
+    }
+    if (menu.itemHint(icons.check, if (a.isSelected(s.uid)) a.t.deselect else a.t.select, "Ctrl+Click", false)) {
+        a.toggleSelected(s.uid);
         close = true;
     }
     if (menu.item(icons.copy, a.t.duplicate, false)) {
@@ -487,7 +535,7 @@ pub fn drawPadMenu(a: *App, m: app_mod.MenuState) void {
     }
     menu.separator();
     if (menu.item(icons.trash_2, a.t.delete, true)) {
-        a.dialog = .{ .delete_sound = m.index };
+        a.deleteSound(m.index);
         close = true;
     }
     if (ui.endMenu(&menu)) {
@@ -748,4 +796,134 @@ fn queueRow(a: *App, qi: usize, uid: u32, row: Rect, inert: bool) void {
 
 fn inertAlpha(inert: bool) f32 {
     return if (inert) 1 else 0;
+}
+
+// ── Selection ───────────────────────────────────────────────────────────────
+
+/// Pads deleted or moved some other way drop out of the selection
+fn pruneSelection(a: *App) void {
+    const ws = a.workspace();
+    var i: usize = 0;
+    while (i < a.selection.items.len) {
+        if (ws.findByUid(a.selection.items[i]) != null) i += 1 else _ = a.selection.orderedRemove(i);
+    }
+}
+
+fn bulkBar(a: *App, r_in: Rect) void {
+    var r = r_in;
+    ui.rect(r, ui.radius_md, ui.colors.accent.alpha(0.08));
+    ui.border(r, ui.radius_md, 1, ui.colors.accent.alpha(0.45));
+    r = r.insetXY(6, 3);
+
+    if (ui.iconButton(ui.id("sel-clear", 0), r.cutLeft(34), icons.x, .{ .size = 15, .tooltip = a.t.sel_clear })) {
+        a.selection.clearRetainingCapacity();
+        return;
+    }
+    const count = if (a.selection.items.len == 1) a.t.sel_count_one else a.tf(a.t.sel_count, .{a.selection.items.len});
+    const count_w = ui.measure(count, 13, .semibold) + 16;
+    ui.label(count, r.cutLeft(count_w), 13, .semibold, ui.colors.text, .left);
+    if (r.w > 760 and ui.button(ui.id("sel-all", 0), r.cutLeft(118), a.t.sel_all, .{ .style = .ghost, .size = 12, .tooltip = "Ctrl+A" })) a.selectAll();
+
+    // Right to left: delete, move, favorite, effects, output, volume
+    if (ui.button(ui.id("sel-del", 0), r.cutRight(104), a.t.delete, .{ .style = .danger, .icon = icons.trash_2, .size = 12, .tooltip = "Del" })) {
+        a.deleteSelected();
+        return;
+    }
+    _ = r.cutRight(6);
+    const many_ws = a.lib.workspaces.items.len > 1;
+    const move_r = r.cutRight(if (many_ws) 104 else 0);
+    if (many_ws and ui.button(ui.id("sel-move", 0), move_r, a.t.sel_move, .{ .icon = icons.folder, .size = 12 })) {
+        bulk_menu = .{ .kind = .move, .pos = .{ .x = move_r.x, .y = move_r.bottom() + 4 } };
+    }
+    _ = r.cutRight(6);
+    if (ui.iconButton(ui.id("sel-fav", 0), r.cutRight(34), icons.star, .{ .size = 15, .tooltip = a.t.favorite, .background = true })) a.favoriteSelected();
+    _ = r.cutRight(6);
+    const fx_r = r.cutRight(110);
+    if (ui.button(ui.id("sel-fx", 0), fx_r, a.t.effects, .{ .icon = icons.wand_sparkles, .size = 12 })) {
+        bulk_menu = .{ .kind = .fx, .pos = .{ .x = fx_r.x, .y = fx_r.bottom() + 4 } };
+    }
+    _ = r.cutRight(6);
+    const out_r = r.cutRight(110);
+    if (ui.button(ui.id("sel-out", 0), out_r, a.t.output_label, .{ .icon = icons.headphones, .size = 12 })) {
+        bulk_menu = .{ .kind = .output, .pos = .{ .x = out_r.x, .y = out_r.bottom() + 4 } };
+    }
+    _ = r.cutRight(12);
+
+    // Volume of the first selected pad drives them all
+    if (r.w >= 150) {
+        const ws = a.workspace();
+        var vol: f32 = 1;
+        for (ws.sounds.items) |s| {
+            if (a.isSelected(s.uid)) {
+                vol = s.volume;
+                break;
+            }
+        }
+        const vol_r = r.cutRight(@min(220, r.w));
+        ui.icon(icons.volume_2, .{ .x = vol_r.x + 10, .y = vol_r.y + vol_r.h / 2 }, 14, ui.colors.text_muted);
+        var pb: [8]u8 = undefined;
+        ui.label(std.fmt.bufPrint(&pb, "{d:.0}%", .{vol * 100}) catch "", .{ .x = vol_r.right() - 40, .y = vol_r.y, .w = 40, .h = vol_r.h }, 12, .mono, ui.colors.text_muted, .right);
+        if (ui.slider(ui.id("sel-vol", 0), .{ .x = vol_r.x + 22, .y = vol_r.y, .w = vol_r.w - 66, .h = vol_r.h }, &vol, 0, 2)) a.setSelectedVolume(vol);
+    }
+}
+
+pub fn drawBulkMenu(a: *App) void {
+    const m = bulk_menu orelse return;
+    var close = false;
+    switch (m.kind) {
+        .output => {
+            var menu = ui.beginMenuW(ui.id("sel-out-menu", 0), m.pos, 3, 0, 240);
+            const routes = [_]struct { r: audio.Route, ic: u21, text: []const u8 }{
+                .{ .r = .both, .ic = icons.monitor_speaker, .text = a.t.output_both },
+                .{ .r = .monitor, .ic = icons.headphones, .text = a.t.output_monitor },
+                .{ .r = .mic, .ic = icons.mic, .text = a.t.output_mic },
+            };
+            for (routes) |rt| {
+                if (menu.item(rt.ic, rt.text, false)) {
+                    a.setSelectedOutput(rt.r);
+                    close = true;
+                }
+            }
+            if (ui.endMenu(&menu)) close = true;
+        },
+        .fx => {
+            const n_user = a.cfg.fx_presets.len;
+            var menu = ui.beginMenuW(ui.id("sel-fx-menu", 0), m.pos, 1 + fx.builtins.len + n_user, 1, 240);
+            if (menu.item(icons.eraser, a.t.sel_fx_clear, false)) {
+                a.setSelectedFx(.{});
+                close = true;
+            }
+            menu.separator();
+            for (fx.builtins) |b| {
+                if (menu.item(b.icon, a.t.fx_preset_names[b.name], false)) {
+                    a.setSelectedFx(fx.Chain.fromSlice(b.effects));
+                    close = true;
+                }
+            }
+            for (a.cfg.fx_presets) |up| {
+                if (menu.item(icons.save, up.name, false)) {
+                    a.setSelectedFx(fx.Chain.fromStored(up.fx));
+                    close = true;
+                }
+            }
+            if (ui.endMenu(&menu)) close = true;
+        },
+        .move => {
+            var rows: usize = 0;
+            for (a.lib.workspaces.items, 0..) |_, i| {
+                if (i != a.ws) rows += 1;
+            }
+            var menu = ui.beginMenuW(ui.id("sel-move-menu", 0), m.pos, @max(rows, 1), 0, 240);
+            for (a.lib.workspaces.items, 0..) |other, i| {
+                if (i == a.ws) continue;
+                if (menu.item(icons.folder, other.name, false)) {
+                    a.moveSelected(i);
+                    close = true;
+                    break;
+                }
+            }
+            if (ui.endMenu(&menu)) close = true;
+        },
+    }
+    if (close) bulk_menu = null;
 }

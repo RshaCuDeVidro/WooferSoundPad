@@ -13,6 +13,7 @@ const config = @import("config.zig");
 const fx = @import("fx.zig");
 const library = @import("library.zig");
 const dialogs = @import("view_dialogs.zig");
+const schedule = @import("schedule.zig");
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const Editor = app_mod.Editor;
@@ -1016,9 +1017,58 @@ fn padTab(a: *App, s: *const library.Sound, e: *Editor, r: Rect, idx: usize) voi
     if (a.hotkeyOwner(e.hotkeyText(), idx)) |owner| {
         ui.label(a.tf(a.t.hotkey_conflict, .{a.workspace().sounds.items[owner].name}), .{ .x = lx, .y = ly + 68, .w = col_w, .h = 16 }, 11, .semibold, ui.colors.warning, .left);
     }
+    ly += 98;
+
+    // Where it is heard
+    dialogs.fieldLabel(lx, ly, a.t.output_label);
+    const outs = [_]ui.Segment{
+        .{ .label = a.t.output_both_short, .icon = icons.monitor_speaker },
+        .{ .label = a.t.output_monitor_short, .icon = icons.headphones },
+        .{ .label = a.t.output_mic_short, .icon = icons.mic },
+    };
+    var out_idx: usize = @backingInt(e.output);
+    if (ui.segmented(ui.id("ed-output", 0), .{ .x = lx, .y = ly + 22, .w = col_w, .h = 38 }, &outs, &out_idx)) e.output = @fromBackingInt(@intCast(out_idx));
+    const out_note = switch (e.output) {
+        .both => a.t.output_both_desc,
+        .monitor => a.t.output_monitor_desc,
+        .mic => if (audio.outputActive(.mic)) a.t.output_mic_desc else a.t.output_mic_off,
+    };
+    ui.label(out_note, .{ .x = lx, .y = ly + 64, .w = col_w, .h = 16 }, 11, .regular, if (e.output == .mic and !audio.outputActive(.mic)) ui.colors.warning else ui.colors.text_faint, .left);
+
+    // Plays by itself (top of the right column)
+    var ry = r.y;
+    dialogs.fieldLabel(rx, ry, a.t.schedule_label);
+    const modes = [_]ui.Segment{
+        .{ .label = a.t.schedule_off },
+        .{ .label = a.t.schedule_every_short, .icon = icons.timer },
+        .{ .label = a.t.schedule_daily_short, .icon = icons.clock },
+    };
+    var mode_idx: usize = @backingInt(e.schedule_mode);
+    if (ui.segmented(ui.id("ed-sched", 0), .{ .x = rx, .y = ry + 22, .w = col_w, .h = 38 }, &modes, &mode_idx)) e.schedule_mode = @fromBackingInt(@intCast(mode_idx));
+    const sy = ry + 70;
+    switch (e.schedule_mode) {
+        .off => {},
+        .every => {
+            // 1, 2 ... 10, then 5-minute steps, then quarters of an hour
+            const step: u32 = if (e.schedule_every < 10) 1 else if (e.schedule_every < 60) 5 else 15;
+            const down: u32 = if (e.schedule_every <= 10) 1 else if (e.schedule_every <= 60) 5 else 15;
+            if (ui.iconButton(ui.id("ed-sched-minus", 0), .{ .x = rx, .y = sy, .w = 34, .h = 34 }, icons.minus, .{ .background = true, .size = 14, .disabled = e.schedule_every <= 1 })) e.schedule_every -|= down;
+            ui.label(a.tf(a.t.schedule_every_n, .{e.schedule_every}), .{ .x = rx + 42, .y = sy, .w = col_w - 84, .h = 34 }, 13, .semibold, ui.colors.text, .center);
+            if (ui.iconButton(ui.id("ed-sched-plus", 0), .{ .x = rx + col_w - 34, .y = sy, .w = 34, .h = 34 }, icons.plus, .{ .background = true, .size = 14, .disabled = e.schedule_every >= 24 * 60 })) e.schedule_every = @min(e.schedule_every + step, 24 * 60);
+            e.schedule_every = @max(e.schedule_every, 1);
+        },
+        .daily => {
+            ui.label(a.t.schedule_daily_at, .{ .x = rx, .y = sy, .w = col_w - 130, .h = 36 }, 13, .regular, ui.colors.text_muted, .left);
+            _ = ui.textInput(ui.id("ed-sched-time", 0), .{ .x = rx + col_w - 120, .y = sy, .w = 120, .h = 36 }, &e.schedule_time, .{ .icon = icons.clock, .placeholder = "09:00", .size = 13, .clearable = false });
+            if (schedule.parseTime(e.schedule_time.text()) == null) {
+                ui.label(a.t.schedule_bad_time, .{ .x = rx + col_w - 120, .y = sy + 38, .w = 120, .h = 14 }, 11, .semibold, ui.colors.warning, .right);
+            }
+        },
+    }
+    ry = sy + (if (e.schedule_mode == .off) @as(f32, 0) else 58);
 
     // About this sound
-    const info: Rect = .{ .x = rx, .y = r.y, .w = col_w, .h = @min(r.h, 214) };
+    const info: Rect = .{ .x = rx, .y = ry, .w = col_w, .h = @max(0, @min(r.bottom() - ry, 214)) };
     ui.rect(info, ui.radius_lg, ui.colors.bg.alpha(0.5));
     var y = info.y + 14;
     const rows = [_]struct { ic: u21, label: []const u8, value: []const u8 }{
@@ -1041,6 +1091,7 @@ fn padTab(a: *App, s: *const library.Sound, e: *Editor, r: Rect, idx: usize) voi
         } },
     };
     for (rows) |row| {
+        if (y + 30 > info.bottom()) break; // a schedule above took the room
         ui.icon(row.ic, .{ .x = info.x + 22, .y = y + 12 }, 14, ui.colors.text_faint);
         _ = ui.text(row.label, info.x + 40, y + 4, 12, .regular, ui.colors.text_muted);
         ui.label(row.value, .{ .x = info.x + 150, .y = y, .w = info.w - 166, .h = 24 }, 12, .semibold, ui.colors.text, .right);
@@ -1054,9 +1105,9 @@ fn footer(a: *App, s: *const library.Sound, e: *Editor, r: Rect, idx: usize, ope
     const fy = r.y + 18;
     ui.rect(.{ .x = r.x - 24, .y = r.y + 2, .w = r.w + 48, .h = 1 }, 0, ui.colors.border.alpha(0.7));
     if (ui.button(ui.id("ed-delete", 0), .{ .x = r.x, .y = fy, .w = 110, .h = 40 }, a.t.delete, .{ .style = .danger, .icon = icons.trash_2 })) {
-        a.cancelEditor(idx);
-        a.dialog = .{ .delete_sound = idx };
-        a.dialog_closing = .none;
+        // Closes the editor and offers an undo
+        previewing = false;
+        a.deleteSound(idx);
         return;
     }
     if (ui.button(ui.id("ed-variant", 0), .{ .x = r.x + 120, .y = fy, .w = 160, .h = 40 }, a.t.create_variant, .{ .icon = icons.git_fork, .style = .ghost, .size = 13, .tooltip = a.t.variant_tip })) {

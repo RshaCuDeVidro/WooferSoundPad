@@ -8,6 +8,11 @@ const ui = @import("ui.zig");
 const app_mod = @import("app.zig");
 
 var enabled = false;
+/// WOOFER_UPDATE_TEST=1 walks through the update flow against the real
+/// GitHub release: screenshots, then "Update" and "Restart now"
+var update_test = false;
+var phase_frames: u32 = 0;
+var shot_downloading = false;
 /// WOOFER_GIF=1 also saves every frame of the mixer scene (gif-000.png...)
 var gif = false;
 var frame: u32 = 0;
@@ -16,6 +21,7 @@ var gif_name: [32]u8 = undefined;
 pub fn init() void {
     enabled = sys.getenv("WOOFER_AUTOSHOT") != null;
     gif = sys.getenv("WOOFER_GIF") != null;
+    update_test = sys.getenv("WOOFER_UPDATE_TEST") != null;
     if (enabled) @import("c").SetMousePosition(2, 790);
 }
 
@@ -285,8 +291,57 @@ const steps = [_]Step{
     .{ .at = 2231, .action = quit },
 };
 
+fn updateTest(a: *app_mod.App) void {
+    const updater = @import("update.zig");
+    frame += 1;
+    switch (frame) {
+        60 => ui.screenshot_path = "upd-0-install-prompt.png",
+        61 => @import("view_dialogs.zig").close(a),
+        62 => {
+            a.goto(.settings);
+            a.settings_tab = 1;
+        },
+        120 => ui.screenshot_path = "upd-1-changelog.png",
+        121 => a.settings_tab = 0,
+        125 => ui.scrollTo(ui.id("settings-scroll", 0), 4000),
+        170 => ui.screenshot_path = "upd-2-settings.png",
+        171 => if (updater.state.load(.acquire) == .available) {
+            a.dialog = .update;
+        },
+        3600 => a.quit_requested = true,
+        else => {},
+    }
+    if (frame < 171) {
+        a.update_popup = false;
+        return;
+    }
+    switch (updater.state.load(.acquire)) {
+        .available => if (a.dialog == .update) {
+            phase_frames += 1;
+            if (phase_frames == 40) ui.screenshot_path = "upd-3-dialog.png";
+            if (phase_frames == 41) updater.install();
+        },
+        .downloading => if (!shot_downloading and updater.progress.get() > 0.3) {
+            shot_downloading = true;
+            ui.screenshot_path = "upd-4-downloading.png";
+            phase_frames = 0;
+        },
+        .ready => {
+            phase_frames += 1;
+            if (phase_frames == 30) ui.screenshot_path = "upd-5-ready.png";
+            if (phase_frames == 31) a.restartForUpdate();
+        },
+        .failed => {
+            ui.screenshot_path = "upd-x-failed.png";
+            a.quit_requested = true;
+        },
+        else => {},
+    }
+}
+
 /// Called once per frame before drawing
 pub fn update(a: *app_mod.App) void {
+    if (update_test) return updateTest(a);
     if (!enabled) return;
     frame += 1;
     if (gif and frame >= 1606 and frame < 1660) {

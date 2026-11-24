@@ -5,10 +5,15 @@ const c = @import("c");
 const ui = @import("ui.zig");
 const theme = @import("theme.zig");
 const audio = @import("audio.zig");
+const config_mod = @import("config.zig");
 const tools = @import("tools.zig");
 const hotkeys = @import("hotkeys.zig");
 const waves = @import("waves.zig");
 const editor = @import("view_editor.zig");
+const changelog_view = @import("view_changelog.zig");
+const updater = @import("update.zig");
+const sys = @import("sys.zig");
+const slicer = @import("slicer.zig");
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const Dialog = app_mod.Dialog;
@@ -36,10 +41,12 @@ pub fn draw(a: *App) void {
         .create_workspace => nameDialog(a, open, a.t.new_workspace, a.t.create, null),
         .rename_workspace => |i| nameDialog(a, open, a.t.rename_workspace, a.t.save, i),
         .delete_workspace => |i| deleteWorkspace(a, open, i),
-        .delete_sound => |i| deleteSound(a, open, i),
         .edit_sound => |i| editor.draw(a, open, i),
+        .slice_sound => |i| sliceDialog(a, open, i),
         .download_media => downloadMedia(a, open),
         .record => recordDialog(a, open),
+        .update => updateDialog(a, open),
+        .install_app => installDialog(a, open),
     }
 }
 
@@ -102,12 +109,102 @@ fn deleteWorkspace(a: *App, open: bool, i: usize) void {
     }
 }
 
-fn deleteSound(a: *App, open: bool, i: usize) void {
+// ── Slice at silences ───────────────────────────────────────────────────────
+
+/// Envelope resolution the silences are found in
+const slice_bins = 8000;
+/// Set when the cutting starts; the dialog closes once it is done
+var slice_started = false;
+
+fn sliceDialog(a: *App, open: bool, i: usize) void {
     const ws = a.workspace();
     if (i >= ws.sounds.items.len) return close(a);
-    if (confirm(a, open, ui.id("dlg-del-sound", 0), a.t.delete_sound_title, a.tf(a.t.delete_sound_body, .{ws.sounds.items[i].name}))) {
-        a.deleteSound(i);
+    const s = &ws.sounds.items[i];
+    const m = ui.beginModal(ui.id("dlg-slice", 0), 760, 520, open) orelse return finished(a);
+    defer ui.endModal();
+    if (m.close_requested) close(a);
+    const busy = a.slice_task != null;
+    if (slice_started and !busy) {
+        slice_started = false;
         close(a);
+    }
+    const r = m.rect;
+    titleBar(a, r, a.t.slice_title);
+    ui.label(s.name, .{ .x = r.x + 24, .y = r.y + 50, .w = r.w - 96, .h = 18 }, 12, .semibold, ui.colors.text_muted, .left);
+
+    // The waveform, with the pieces it will be cut into over it
+    const wave_r: Rect = .{ .x = r.x + 24, .y = r.y + 84, .w = r.w - 48, .h = 160 };
+    ui.rect(wave_r, ui.radius_md, ui.colors.bg);
+    ui.border(wave_r, ui.radius_md, 1, ui.colors.border);
+    const path = ws.soundPath(s) catch return close(a);
+    defer sys.gpa.free(path);
+    const col = theme.padColor(s.color, ui.colors.accent);
+    if (waves.get(path, slice_bins)) |wv| {
+        a.slice.count = slicer.segments(wv.peaks, wv.duration, a.slice.opts, &a.slice.pieces);
+        const inner = wave_r.insetXY(8, 10);
+        for (a.slice.pieces[0..a.slice.count], 0..) |p, k| {
+            const x0 = inner.x + p.start / wv.duration * inner.w;
+            const x1 = inner.x + p.end / wv.duration * inner.w;
+            ui.rect(.{ .x = x0, .y = wave_r.y + 2, .w = @max(2, x1 - x0), .h = wave_r.h - 4 }, 3, col.alpha(0.14));
+            ui.rect(.{ .x = x0, .y = wave_r.y + 2, .w = 1, .h = wave_r.h - 4 }, 0, col.alpha(0.8));
+            var nb: [4]u8 = undefined;
+            if (x1 - x0 > 16) _ = ui.text(std.fmt.bufPrint(&nb, "{d}", .{k + 1}) catch "", x0 + 4, wave_r.y + 6, 10, .mono_bold, col);
+        }
+        const cols: usize = @intFromFloat(@max(1, inner.w / 2));
+        const per = @max(1, wv.peaks.len / cols);
+        for (0..cols) |cx| {
+            var peak: f32 = 0;
+            const from = cx * wv.peaks.len / cols;
+            for (wv.peaks[from..@min(wv.peaks.len, from + per)]) |v| peak = @max(peak, v);
+            const h = @max(1, @sqrt(peak) * inner.h);
+            ui.rect(.{ .x = inner.x + @as(f32, @floatFromInt(cx)) * 2, .y = inner.y + (inner.h - h) / 2, .w = 1.5, .h = h }, 0, ui.colors.text_muted.alpha(0.8));
+        }
+        // Where "silence" starts
+        const thr = @sqrt(std.math.pow(f32, 10, a.slice.opts.threshold_db / 20)) * inner.h / 2;
+        const mid = inner.y + inner.h / 2;
+        ui.rect(.{ .x = inner.x, .y = mid - thr, .w = inner.w, .h = 1 }, 0, ui.colors.warning.alpha(0.5));
+        ui.rect(.{ .x = inner.x, .y = mid + thr, .w = inner.w, .h = 1 }, 0, ui.colors.warning.alpha(0.5));
+    } else {
+        a.slice.count = 0;
+        ui.spinner(wave_r.center(), 12, ui.colors.accent);
+    }
+
+    // Settings
+    var y = wave_r.bottom() + 22;
+    const sliders = [_]struct { label: []const u8, value: *f32, min: f32, max: f32, unit: []const u8 }{
+        .{ .label = a.t.slice_threshold, .value = &a.slice.opts.threshold_db, .min = -60, .max = -18, .unit = "dB" },
+        .{ .label = a.t.slice_min_silence, .value = &a.slice.opts.min_silence, .min = 0.1, .max = 2, .unit = "s" },
+        .{ .label = a.t.slice_min_length, .value = &a.slice.opts.min_length, .min = 0.1, .max = 5, .unit = "s" },
+    };
+    for (sliders, 0..) |sl, k| {
+        ui.label(sl.label, .{ .x = r.x + 24, .y = y, .w = 240, .h = 32 }, 13, .semibold, ui.colors.text, .left);
+        var vb: [16]u8 = undefined;
+        const txt = std.fmt.bufPrint(&vb, "{d:.1} {s}", .{ sl.value.*, sl.unit }) catch "";
+        ui.label(txt, .{ .x = r.right() - 104, .y = y, .w = 80, .h = 32 }, 12, .mono, ui.colors.text_muted, .right);
+        ui.pushAlpha(if (busy) 0.5 else 1);
+        if (!busy) _ = ui.slider(ui.id("slice-opt", k), .{ .x = r.x + 270, .y = y, .w = r.w - 390, .h = 32 }, sl.value, sl.min, sl.max);
+        ui.popAlpha();
+        y += 42;
+    }
+
+    // Footer
+    const fy = r.bottom() - 62;
+    if (a.slice_task) |t| {
+        ui.progressBar(.{ .x = r.x + 24, .y = fy + 18, .w = r.w - 300, .h = 5 }, t.progress(), ui.colors.accent);
+        ui.label(a.t.slice_working, .{ .x = r.x + 24, .y = fy - 6, .w = r.w - 300, .h = 20 }, 12, .semibold, ui.colors.text_muted, .left);
+    } else {
+        const info = switch (a.slice.count) {
+            0 => a.t.slice_none,
+            1 => a.t.slice_count_one,
+            else => a.tf(a.t.slice_count, .{a.slice.count}),
+        };
+        ui.label(info, .{ .x = r.x + 24, .y = fy, .w = r.w - 300, .h = 40 }, 13, .regular, ui.colors.text_muted, .left);
+    }
+    if (ui.button(ui.id("slice-cancel", 0), .{ .x = r.right() - 272, .y = fy, .w = 110, .h = 40 }, a.t.cancel, .{ .style = .ghost })) close(a);
+    const go = ui.button(ui.id("slice-go", 0), .{ .x = r.right() - 154, .y = fy, .w = 130, .h = 40 }, if (a.slice.count == 1) a.t.slice_create_one else a.tf(a.t.slice_create, .{a.slice.count}), .{ .style = .primary, .icon = icons.scissors, .disabled = a.slice.count == 0 or busy, .loading = busy });
+    if (open and go and !busy) {
+        a.startSlice(i);
+        slice_started = a.slice_task != null;
     }
 }
 
@@ -392,4 +489,122 @@ fn recHandle(key: u64, hx: f32, wr: Rect) ui.Interaction {
     ui.border(knob, 6, 1.5, ui.colors.danger);
     if (in.hovered) ui.setCursor(c.MOUSE_CURSOR_RESIZE_EW);
     return in;
+}
+
+// ── Update ──────────────────────────────────────────────────────────────────
+
+fn updateDialog(a: *App, open: bool) void {
+    const key = ui.id("dlg-update", 0);
+    // The notes box grows with the text, up to a point (then it scrolls)
+    const txt = if (updater.notes().len > 0) updater.notes() else a.t.upd_no_notes;
+    const notes_h = changelog_view.notes(txt, 0, 0, 600 - 48 - 42, false);
+    const box_h = std.math.clamp(notes_h + 58, 110, 330);
+    const m = ui.beginModal(key, 600, 108 + box_h + 130, open) orelse return finished(a);
+    defer ui.endModal();
+    const st = updater.state.load(.acquire);
+    if (m.close_requested and st != .downloading) close(a);
+    const r = m.rect;
+
+    // Header: the new version, big
+    ui.rect(.{ .x = r.x, .y = r.y + 28, .w = 4, .h = 52 }, 1, ui.colors.accent);
+    const badge_r: Rect = .{ .x = r.x + 28, .y = r.y + 26, .w = 56, .h = 56 };
+    ui.rect(badge_r, ui.radius_md, ui.colors.accent.alpha(0.12));
+    ui.border(badge_r, ui.radius_md, 1, ui.colors.accent.alpha(0.4));
+    ui.icon(if (st == .ready) icons.check else icons.download, badge_r.center(), 24, ui.colors.accent);
+    const title = if (st == .ready) a.t.upd_installed_title else a.t.upd_title;
+    const subtitle = if (st == .ready) a.tf(a.t.upd_installed_sub, .{updater.latestVersion()}) else a.tf(a.t.upd_subtitle, .{ updater.latestVersion(), a.version });
+    ui.label(title, .{ .x = badge_r.right() + 18, .y = r.y + 28, .w = r.w - 170, .h = 26 }, 18, .display, ui.colors.text, .left);
+    _ = ui.text(subtitle, badge_r.right() + 18, r.y + 60, 12, .mono, ui.colors.text_muted);
+    if (st != .downloading) {
+        if (ui.iconButton(ui.id("dlg-x", 0), .{ .x = r.right() - 48, .y = r.y + 16, .w = 32, .h = 32 }, icons.x, .{ .size = 17 })) close(a);
+    }
+
+    // Release notes
+    const box: Rect = .{ .x = r.x + 24, .y = r.y + 108, .w = r.w - 48, .h = box_h };
+    ui.rect(box, ui.radius_md, ui.colors.surface);
+    ui.border(box, ui.radius_md, 1, ui.colors.border);
+    _ = ui.text(a.t.upd_whats_new, box.x + 18, box.y + 14, 11, .mono_bold, ui.colors.text_faint);
+    const view: Rect = .{ .x = box.x + 1, .y = box.y + 38, .w = box.w - 2, .h = box.h - 42 };
+    const top = ui.beginScroll(ui.sub(key, 10), view);
+    const h = changelog_view.notes(txt, view.x + 17, top + 4, view.w - 40, true);
+    ui.endScroll(h + 16);
+
+    _ = ui.text(a.t.upd_safe, r.x + 26, box.bottom() + 14, 12, .regular, ui.colors.text_muted);
+
+    // Footer: depends on where the update is
+    const fy = r.bottom() - 64;
+    const right = r.right() - 24;
+    switch (st) {
+        .available => {
+            if (ui.button(ui.sub(key, 1), .{ .x = r.x + 24, .y = fy, .w = 170, .h = 40 }, a.t.upd_skip, .{ .style = .ghost })) {
+                config_mod.setString(&a.cfg.update_skip, updater.latestVersion());
+                a.markConfig();
+                close(a);
+            }
+            if (ui.button(ui.sub(key, 2), .{ .x = right - 300, .y = fy, .w = 120, .h = 40 }, a.t.upd_later, .{ .style = .ghost })) close(a);
+            const mb = @max(1, (updater.downloadSize() + 512 * 1024) / (1024 * 1024));
+            if (ui.button(ui.sub(key, 3), .{ .x = right - 172, .y = fy, .w = 172, .h = 40 }, a.tf(a.t.upd_install_size, .{mb}), .{ .style = .primary, .icon = icons.download }) and open) {
+                updater.install();
+            }
+        },
+        .downloading => {
+            const p = updater.progress.get();
+            const checking = updater.verifying.load(.acquire);
+            const label = if (checking) a.t.upd_verifying else a.tf(a.t.upd_downloading, .{updater.latestVersion()});
+            _ = ui.text(label, r.x + 26, fy - 2, 12, .semibold, ui.colors.text);
+            if (p >= 0 and !checking) {
+                var pb: [16]u8 = undefined;
+                const pct = std.fmt.bufPrint(&pb, "{d:.0}%", .{p * 100}) catch "";
+                ui.label(pct, .{ .x = right - 260, .y = fy - 4, .w = 100, .h = 18 }, 12, .mono, ui.colors.text_muted, .right);
+            } else ui.spinner(.{ .x = right - 168, .y = fy + 5 }, 7, ui.colors.accent);
+            ui.progressBar(.{ .x = r.x + 26, .y = fy + 24, .w = r.w - 52 - 150, .h = 6 }, p, ui.colors.accent);
+            if (ui.button(ui.sub(key, 4), .{ .x = right - 130, .y = fy, .w = 130, .h = 40 }, a.t.cancel, .{ .style = .ghost })) updater.cancel();
+        },
+        .ready => {
+            if (ui.button(ui.sub(key, 5), .{ .x = right - 300, .y = fy, .w = 120, .h = 40 }, a.t.upd_restart_later, .{ .style = .ghost })) close(a);
+            if (ui.button(ui.sub(key, 6), .{ .x = right - 172, .y = fy, .w = 172, .h = 40 }, a.t.upd_restart, .{ .style = .primary, .icon = icons.refresh_cw })) {
+                a.restartForUpdate();
+            }
+        },
+        .failed => {
+            const msg = a.tf(a.t.upd_failed, .{a.updateFailureText()});
+            ui.icon(icons.triangle_alert, .{ .x = r.x + 34, .y = fy - 22 }, 14, ui.colors.danger);
+            ui.label(msg, .{ .x = r.x + 48, .y = fy - 32, .w = r.w - 80, .h = 20 }, 12, .semibold, ui.colors.danger, .left);
+            if (ui.button(ui.sub(key, 7), .{ .x = right - 380, .y = fy, .w = 200, .h = 40 }, a.t.upd_open_page, .{ .style = .ghost, .icon = icons.external_link })) {
+                sys.openUrl(updater.pageUrl());
+            }
+            if (ui.button(ui.sub(key, 8), .{ .x = right - 172, .y = fy, .w = 172, .h = 40 }, a.t.retry, .{ .style = .primary, .icon = icons.refresh_cw })) {
+                updater.check(false);
+            }
+        },
+        else => {
+            ui.spinner(.{ .x = r.x + 40, .y = fy + 20 }, 8, ui.colors.accent);
+            _ = ui.text(a.t.upd_checking, r.x + 58, fy + 12, 12, .semibold, ui.colors.text_muted);
+            if (st == .up_to_date) close(a);
+        },
+    }
+}
+
+// ── Linux app menu ──────────────────────────────────────────────────────────
+
+fn installDialog(a: *App, open: bool) void {
+    const key = ui.id("dlg-install", 0);
+    const m = ui.beginModal(key, 520, 240, open) orelse return finished(a);
+    defer ui.endModal();
+    if (m.close_requested) close(a);
+    const r = m.rect;
+
+    const logo_r: Rect = .{ .x = r.x + 30, .y = r.y + 32, .w = 80, .h = 80 };
+    ui.glow(logo_r.center(), 120, ui.colors.accent.alpha(0.16));
+    ui.image(a.logo, logo_r.offset(0, @sin(ui.time * 1.6) * 2), 0, .{ .r = 1, .g = 1, .b = 1 });
+    const tx = logo_r.right() + 26;
+    ui.label(a.t.inst_title, .{ .x = tx, .y = r.y + 34, .w = r.right() - tx - 50, .h = 26 }, 18, .display, ui.colors.text, .left);
+    _ = ui.paragraph(a.t.inst_body, .{ .x = tx, .y = r.y + 72, .w = r.right() - tx - 30, .h = 120 }, 13, .regular, ui.colors.text_muted, 1.5, true);
+    if (ui.iconButton(ui.id("dlg-x", 0), .{ .x = r.right() - 48, .y = r.y + 16, .w = 32, .h = 32 }, icons.x, .{ .size = 17 })) close(a);
+
+    if (ui.button(ui.sub(key, 1), .{ .x = r.right() - 292, .y = r.bottom() - 64, .w = 120, .h = 40 }, a.t.upd_later, .{ .style = .ghost })) close(a);
+    if (ui.button(ui.sub(key, 2), .{ .x = r.right() - 164, .y = r.bottom() - 64, .w = 140, .h = 40 }, a.t.inst_install, .{ .style = .primary, .icon = icons.download }) and open) {
+        a.installDesktop();
+        close(a);
+    }
 }

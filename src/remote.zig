@@ -66,6 +66,20 @@ pub fn running() bool {
     return status == .running;
 }
 
+var lan_ip_buf: [48]u8 = undefined;
+var lan_ip_len: usize = 0;
+var lan_ip_at: f32 = -100;
+
+/// This computer's address on the local network, looked up every few seconds
+/// (Wi-Fi can change it), or null when offline
+pub fn lanIp() ?[]const u8 {
+    if (ui.time - lan_ip_at > 5) {
+        lan_ip_at = ui.time;
+        lan_ip_len = if (c.woof_http_lan_ip(&lan_ip_buf, lan_ip_buf.len) == 0) std.mem.indexOfScalar(u8, &lan_ip_buf, 0) orelse 0 else 0;
+    }
+    return if (lan_ip_len > 0) lan_ip_buf[0..lan_ip_len] else null;
+}
+
 /// Next command as (verb, argument)
 pub fn poll(buf: *[256]u8) ?struct { verb: []const u8, arg: []const u8 } {
     if (status != .running) return null;

@@ -14,6 +14,12 @@ const vmic = @import("vmic.zig");
 const hotkeys = @import("hotkeys.zig");
 const view = @import("view.zig");
 const remote = @import("remote.zig");
+const updater = @import("update.zig");
+const desktop = @import("desktop.zig");
+const changelog_view = @import("view_changelog.zig");
+const fx = @import("fx.zig");
+const qr = @import("qr.zig");
+const transcribe = @import("transcribe.zig");
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const icons = ui.icons;
@@ -32,6 +38,14 @@ const Layout = struct {
 pub fn draw(a: *App, area: Rect) void {
     var r = area.insetXY(view.page_pad_x, 0);
     _ = view.header(&r, a.t.settings_title, a.t.settings_sub);
+    const tab_items = [_]ui.Tab{
+        .{ .label = a.t.set_tab_general, .icon = icons.sliders_horizontal },
+        .{ .label = a.t.set_tab_changelog, .icon = icons.sparkles, .badge = @intFromBool(updater.state.load(.acquire) == .available) },
+    };
+    _ = ui.tabs(ui.id("set-tabs", 0), r.cutTop(44), &tab_items, &a.settings_tab);
+    _ = r.cutTop(14);
+    if (a.settings_tab == 1) return changelog_view.draw(a, r);
+
     const width = @min(r.w - 10, 860);
     const scroll_key = ui.id("settings-scroll", 0);
     const top = ui.beginScroll(scroll_key, r);
@@ -39,11 +53,15 @@ pub fn draw(a: *App, area: Rect) void {
 
     appearance(a, &l);
     audioSection(a, &l);
+    masterSection(a, &l);
     virtualMic(a, &l);
     hotkeySection(a, &l);
     integrationsSection(a, &l);
     librarySection(a, &l);
     toolsSection(a, &l);
+    transcribeSection(a, &l);
+    updatesSection(a, &l);
+    if (desktop.supported) installSection(a, &l);
     about(a, &l);
 
     ui.endScroll(l.y - top + 30);
@@ -281,6 +299,78 @@ fn audioSection(a: *App, l: *Layout) void {
 
 // ── Virtual microphone ──────────────────────────────────────────────────────
 
+// ── Master bus ──────────────────────────────────────────────────────────────
+
+var preset_items: std.ArrayList([]const u8) = .empty;
+
+fn masterSection(a: *App, l: *Layout) void {
+    sectionHeader(l, icons.sliders_vertical, a.t.sec_master);
+    _ = card(l, 8, 0);
+    const bands = [_]struct { title: []const u8, value: *f32 }{
+        .{ .title = a.t.eq_low, .value = &a.cfg.master_eq_low },
+        .{ .title = a.t.eq_mid, .value = &a.cfg.master_eq_mid },
+        .{ .title = a.t.eq_high, .value = &a.cfg.master_eq_high },
+    };
+    for (bands, 0..) |b, i| {
+        const ctrl = row(l, b.title, if (i == 0) a.t.eq_desc else "", i == 0);
+        var vb: [16]u8 = undefined;
+        ui.label(std.fmt.bufPrint(&vb, "{s}{d:.1} dB", .{ if (b.value.* > 0) "+" else "", b.value.* }) catch "", .{ .x = ctrl.right() - 70, .y = ctrl.y, .w = 70, .h = ctrl.h }, 13, .semibold, ui.colors.text_muted, .right);
+        if (ui.slider(ui.id("set-eq", i), .{ .x = ctrl.x, .y = ctrl.y, .w = ctrl.w - 78, .h = ctrl.h }, b.value, -12, 12)) {
+            if (@abs(b.value.*) < 0.4) b.value.* = 0; // easy to put back to flat
+            audio.applyMaster(&a.cfg);
+            a.markConfig();
+        }
+    }
+
+    var ctrl = row(l, a.t.compressor, a.t.compressor_desc, false);
+    var cb: [16]u8 = undefined;
+    const comp_txt = if (a.cfg.master_comp < 0.01) a.t.off else std.fmt.bufPrint(&cb, "{d:.0}%", .{a.cfg.master_comp * 100}) catch "";
+    ui.label(comp_txt, .{ .x = ctrl.right() - 70, .y = ctrl.y, .w = 70, .h = ctrl.h }, 13, .semibold, ui.colors.text_muted, .right);
+    if (ui.slider(ui.id("set-comp", 0), .{ .x = ctrl.x, .y = ctrl.y, .w = ctrl.w - 78, .h = ctrl.h }, &a.cfg.master_comp, 0, 1)) {
+        audio.applyMaster(&a.cfg);
+        a.markConfig();
+    }
+    ctrl = row(l, a.t.limiter, a.t.limiter_desc, false);
+    if (ui.toggle(ui.id("set-limiter", 0), ctrl, &a.cfg.master_limiter)) {
+        audio.applyMaster(&a.cfg);
+        a.markConfig();
+    }
+
+    // Global effect: built-in presets, then the user's
+    ctrl = row(l, a.t.global_fx, a.t.global_fx_desc, false);
+    preset_items.clearRetainingCapacity();
+    for (fx.builtins) |b| preset_items.append(sys.gpa, a.t.fx_preset_names[b.name]) catch {};
+    for (a.cfg.fx_presets) |up| preset_items.append(sys.gpa, up.name) catch {};
+    var preset_idx: usize = 3;
+    const cur = a.cfg.global_fx_preset;
+    if (cur.len > 1 and cur[0] == '@') {
+        preset_idx = std.fmt.parseInt(usize, cur[1..], 10) catch 3;
+    } else for (a.cfg.fx_presets, 0..) |up, i| {
+        if (std.mem.eql(u8, up.name, cur)) preset_idx = fx.builtins.len + i;
+    }
+    const test_r: Rect = .{ .x = ctrl.right() - 104, .y = ctrl.y, .w = 104, .h = ctrl.h };
+    if (ui.dropdown(ui.id("set-gfx", 0), .{ .x = ctrl.x, .y = ctrl.y, .w = ctrl.w - 112, .h = ctrl.h }, preset_items.items, &preset_idx)) {
+        var nb: [8]u8 = undefined;
+        const value = if (preset_idx < fx.builtins.len) std.fmt.bufPrint(&nb, "@{d}", .{preset_idx}) catch "@3" else a.cfg.fx_presets[preset_idx - fx.builtins.len].name;
+        config.setString(&a.cfg.global_fx_preset, value);
+        a.applyGlobalFx();
+        a.markConfig();
+    }
+    // Hold to hear it on whatever is playing
+    const hold = ui.interact(ui.id("set-gfx-test", 0), test_r);
+    if (hold.held) a.global_fx_preview = true;
+    ui.rect(test_r, ui.radius_md, if (hold.held) ui.colors.accent.alpha(0.25) else ui.colors.surface.shade(0.04 * hold.hover_t));
+    ui.border(test_r, ui.radius_md, 1, if (hold.held) ui.colors.accent else ui.colors.border);
+    ui.label(a.t.global_fx_test, test_r, 12, .semibold, if (hold.held) ui.colors.accent else ui.colors.text, .center);
+    if (hold.hovered) ui.tooltip(ui.id("set-gfx-test", 0), a.t.global_fx_test_tip);
+
+    ctrl = row(l, a.t.global_fx_key, a.t.global_fx_key_desc, false);
+    hotkeyField(a, ui.id("set-gfxkey", 0), ctrl, .global_fx, &a.cfg.global_fx_hotkey);
+    ctrl = row(l, a.t.global_fx_latch, a.t.global_fx_latch_desc, false);
+    _ = ui.toggle(ui.id("set-gfx-latch", 0), ctrl, &a.global_fx_latched);
+    sectionEnd(l);
+}
+
 fn virtualMic(a: *App, l: *Layout) void {
     sectionHeader(l, icons.mic, a.t.sec_vmic);
     if (sys.is_windows) {
@@ -471,7 +561,7 @@ fn hotkeyField(a: *App, key: u64, r: Rect, kind: app_mod.Capture, value: *[]cons
 fn integrationsSection(a: *App, l: *Layout) void {
     sectionHeader(l, icons.plug, a.t.sec_integrations);
     const rows: usize = if (a.cfg.http_enabled) 6 else 1;
-    _ = card(l, rows, if (a.cfg.http_enabled) 40 else 0);
+    _ = card(l, rows, if (a.cfg.http_enabled) 40 + phone_h else 0);
 
     const status_txt = switch (remote.status) {
         .off => a.t.http_off,
@@ -534,7 +624,73 @@ fn integrationsSection(a: *App, l: *Layout) void {
         a.markConfig();
     }
     l.y += foot.h;
+    phoneBlock(a, l);
     sectionEnd(l);
+}
+
+const phone_h: f32 = 200;
+var qr_text: [200]u8 = undefined;
+var qr_len: usize = 0;
+var qr_code: ?qr.Qr = null;
+
+/// The web deck as a QR code for the phone's camera
+fn phoneBlock(a: *App, l: *Layout) void {
+    const box: Rect = .{ .x = l.x, .y = l.y, .w = l.w, .h = phone_h };
+    l.y += phone_h;
+    ui.rect(.{ .x = box.x + 18, .y = box.y, .w = box.w - 36, .h = 1 }, 0, ui.colors.border.alpha(0.7));
+    const qr_r: Rect = .{ .x = box.x + 20, .y = box.y + 18, .w = 164, .h = 164 };
+    const tx = qr_r.right() + 24;
+    const tw = box.right() - 20 - tx;
+    _ = ui.text(a.t.phone_title, tx, qr_r.y + 6, 14, .semibold, ui.colors.text);
+
+    const ip = if (a.cfg.http_lan) remote.lanIp() else null;
+    var url_buf: [200]u8 = undefined;
+    const url = if (ip) |addr| std.fmt.bufPrint(&url_buf, "http://{s}:{d}/deck?key={s}", .{ addr, a.cfg.http_port, a.cfg.http_token }) catch "" else "";
+    if (url.len == 0) {
+        ui.rect(qr_r, ui.radius_md, ui.colors.bg);
+        ui.border(qr_r, ui.radius_md, 1, ui.colors.border);
+        ui.icon(icons.monitor_speaker, qr_r.center(), 34, ui.colors.text_faint);
+        const why = if (!a.cfg.http_lan) a.t.phone_need_lan else a.t.phone_offline;
+        _ = ui.paragraph(why, .{ .x = tx, .y = qr_r.y + 34, .w = tw, .h = 0 }, 13, .regular, ui.colors.text_muted, 1.45, true);
+        if (!a.cfg.http_lan and ui.button(ui.id("phone-lan", 0), .{ .x = tx, .y = qr_r.y + 96, .w = 220, .h = 36 }, a.t.phone_enable_lan, .{ .icon = icons.globe, .style = .primary, .size = 13 })) {
+            a.cfg.http_lan = true;
+            remote.apply(&a.cfg);
+            a.markConfig();
+        }
+        return;
+    }
+
+    // Encoded again only when the address, port or key changes
+    if (qr_len != url.len or !std.mem.eql(u8, qr_text[0..qr_len], url)) {
+        qr_len = @min(url.len, qr_text.len);
+        @memcpy(qr_text[0..qr_len], url[0..qr_len]);
+        qr_code = qr.encode(url) catch null;
+    }
+    if (qr_code) |*code| {
+        // White with a quiet zone, whatever the theme, so every camera reads it
+        const n: f32 = @floatFromInt(code.size);
+        const m = @floor(qr_r.w / (n + 8));
+        const side = m * (n + 8);
+        const bg: Rect = .{ .x = qr_r.x + (qr_r.w - side) / 2, .y = qr_r.y + (qr_r.h - side) / 2, .w = side, .h = side };
+        ui.rect(bg, ui.radius_sm, .{ .r = 1, .g = 1, .b = 1 });
+        for (0..code.size) |y| {
+            for (0..code.size) |x| {
+                if (!code.get(x, y)) continue;
+                ui.rect(.{ .x = bg.x + (@as(f32, @floatFromInt(x)) + 4) * m, .y = bg.y + (@as(f32, @floatFromInt(y)) + 4) * m, .w = m, .h = m }, 0, .{ .r = 0, .g = 0, .b = 0 });
+            }
+        }
+    }
+    _ = ui.paragraph(a.t.phone_desc, .{ .x = tx, .y = qr_r.y + 34, .w = tw, .h = 0 }, 13, .regular, ui.colors.text_muted, 1.45, true);
+    const url_r: Rect = .{ .x = tx, .y = qr_r.bottom() - 40, .w = tw - 44, .h = 36 };
+    ui.rect(url_r, ui.radius_sm, ui.colors.bg);
+    ui.label(url, url_r.insetXY(10, 0), 11, .mono, ui.colors.text_muted, .left);
+    if (ui.iconButton(ui.id("phone-copy", 0), .{ .x = url_r.right() + 8, .y = url_r.y + 2, .w = 32, .h = 32 }, icons.copy, .{ .size = 14, .tooltip = a.t.copy })) {
+        var z: [201]u8 = undefined;
+        @memcpy(z[0..url.len], url);
+        z[url.len] = 0;
+        c.SetClipboardText(@ptrCast(&z));
+        ui.toast(.success, a.t.copied);
+    }
 }
 
 /// A row with a URL in mono and buttons to copy / open it
@@ -559,7 +715,7 @@ fn urlRow(a: *App, l: *Layout, key: u64, title: []const u8, desc: []const u8, ur
 
 fn librarySection(a: *App, l: *Layout) void {
     sectionHeader(l, icons.library, a.t.sec_library);
-    _ = card(l, 3, 0);
+    _ = card(l, 4, 0);
 
     var ctrl = row(l, a.t.library_folder, a.lib.root, true);
     const browse_r: Rect = .{ .x = ctrl.x, .y = ctrl.y, .w = 120, .h = ctrl.h };
@@ -592,6 +748,9 @@ fn librarySection(a: *App, l: *Layout) void {
         ui.toast(.success, a.t.cache_cleared);
     }
 
+    ctrl = row(l, a.t.watch_folders, a.t.watch_folders_desc, false);
+    if (ui.toggle(ui.id("set-watch", 0), ctrl, &a.cfg.watch_folders)) a.markConfig();
+
     ctrl = row(l, a.t.config_folder, config.path, false);
     if (ui.button(ui.id("cfg-open", 0), .{ .x = ctrl.right() - 150, .y = ctrl.y, .w = 150, .h = ctrl.h }, a.t.open_folder, .{ .icon = icons.folder_open, .style = .ghost })) {
         sys.openFolder(std.fs.path.dirname(config.path) orelse ".");
@@ -600,6 +759,58 @@ fn librarySection(a: *App, l: *Layout) void {
 }
 
 // ── Downloads & tools ───────────────────────────────────────────────────────
+
+// ── Search by speech ────────────────────────────────────────────────────────
+
+fn transcribeSection(a: *App, l: *Layout) void {
+    sectionHeader(l, icons.audio_lines, a.t.sec_transcribe);
+    _ = card(l, 4, 0);
+    var ctrl = row(l, a.t.tr_enable, a.t.tr_enable_desc, true);
+    if (ui.toggle(ui.id("set-tr", 0), ctrl, &a.cfg.transcribe)) a.markConfig();
+
+    // The program
+    const prog_desc = if (transcribe.program) |p| p else if (transcribe.can_install_program) a.t.tr_program_download else a.t.tr_program_missing;
+    ctrl = row(l, "whisper.cpp", prog_desc, false);
+    if (ui.button(ui.id("tr-pick", 0), .{ .x = ctrl.right() - 120, .y = ctrl.y, .w = 120, .h = ctrl.h }, a.t.browse, .{ .icon = icons.folder_open, .style = .ghost, .size = 13 })) {
+        const title = a.tfz(a.t.tr_pick_title, .{});
+        if (c.tinyfd_openFileDialog(title.ptr, null, 0, null, null, 0)) |picked| {
+            config.setString(&a.cfg.whisper_path, std.mem.span(picked));
+            transcribe.detect(a.cfg.whisper_path);
+            a.resumeTranscription();
+            a.markConfig();
+        }
+    }
+
+    // The model (and the program on Windows), downloaded together
+    const need_program = transcribe.can_install_program and transcribe.program == null;
+    const model_ok = transcribe.modelReady();
+    ctrl = row(l, a.t.tr_model, if (model_ok) a.t.tr_model_ready else a.tf(a.t.tr_model_missing, .{transcribe.model_size_mb}), false);
+    if (a.transcribe_setup) |setup| {
+        const stage = if (setup.stage.load(.acquire) == 0) a.t.tr_model else "whisper.cpp";
+        ui.label(stage, .{ .x = ctrl.x, .y = ctrl.y - 4, .w = ctrl.w, .h = 18 }, 11, .semibold, ui.colors.text_muted, .left);
+        ui.progressBar(.{ .x = ctrl.x, .y = ctrl.y + 22, .w = ctrl.w, .h = 5 }, setup.progress.get(), ui.colors.accent);
+    } else if (!model_ok or need_program) {
+        const mb = (if (model_ok) 0 else transcribe.model_size_mb) + (if (need_program) transcribe.program_size_mb else 0);
+        if (ui.button(ui.id("tr-setup", 0), .{ .x = ctrl.right() - 170, .y = ctrl.y, .w = 170, .h = ctrl.h }, a.tf(a.t.tr_download, .{mb}), .{ .icon = icons.download, .style = .primary, .size = 13 })) a.startWhisperSetup();
+    } else {
+        ui.icon(icons.circle_check, .{ .x = ctrl.right() - 12, .y = ctrl.y + ctrl.h / 2 }, 16, ui.colors.success);
+    }
+
+    // How far it got
+    const p = a.transcribeProgress();
+    const stalled = a.transcribeStalled();
+    const status = if (stalled)
+        a.t.tr_stalled
+    else if (a.transcribe_task != null)
+        a.tf(a.t.tr_working, .{ p.done, p.total })
+    else
+        a.tf(a.t.tr_done_n, .{ p.done, p.total });
+    ctrl = row(l, a.t.tr_progress, status, false);
+    if (stalled) {
+        if (ui.button(ui.id("tr-resume", 0), .{ .x = ctrl.right() - 150, .y = ctrl.y, .w = 150, .h = ctrl.h }, a.t.retry, .{ .icon = icons.refresh_cw, .size = 13 })) a.resumeTranscription();
+    } else if (ui.button(ui.id("tr-again", 0), .{ .x = ctrl.right() - 170, .y = ctrl.y, .w = 170, .h = ctrl.h }, a.t.tr_again, .{ .icon = icons.rotate_ccw, .style = .ghost, .size = 13, .disabled = p.done == 0 })) a.retranscribeAll();
+    sectionEnd(l);
+}
 
 fn toolsSection(a: *App, l: *Layout) void {
     sectionHeader(l, icons.wrench, a.t.sec_tools);
@@ -681,6 +892,67 @@ fn toolRow(a: *App, l: *Layout, tool: tools.Tool, name: []const u8, desc: []cons
     }
     const pill: Rect = .{ .x = bx - pw - 10, .y = ctrl.y + 8, .w = pw, .h = 20 };
     ui.badge(pill, status_txt, pill_col.alpha(0.15), pill_col);
+}
+
+// ── Updates ─────────────────────────────────────────────────────────────────
+
+fn updatesSection(a: *App, l: *Layout) void {
+    sectionHeader(l, icons.refresh_cw, a.t.sec_updates);
+    _ = card(l, 2, 0);
+    var ctrl = row(l, a.t.upd_auto, a.t.upd_auto_desc, true);
+    if (ui.toggle(ui.id("set-upd-auto", 0), ctrl, &a.cfg.update_check)) a.markConfig();
+
+    const st = updater.state.load(.acquire);
+    const latest = updater.latestVersion();
+    const title = switch (st) {
+        .checking => a.t.upd_checking,
+        .up_to_date => a.t.upd_latest,
+        .available => a.tf(a.t.upd_available, .{latest}),
+        .downloading => a.tf(a.t.upd_downloading, .{latest}),
+        .ready => a.tf(a.t.upd_ready, .{latest}),
+        .failed => a.tf(a.t.upd_failed, .{a.updateFailureText()}),
+        .idle => a.tf(a.t.version_fmt, .{a.version}),
+    };
+    ctrl = row(l, title, a.tf(a.t.upd_current, .{a.version}), false);
+    const bw: f32 = 170;
+    const br: Rect = .{ .x = ctrl.right() - bw, .y = ctrl.y, .w = bw, .h = ctrl.h };
+    switch (st) {
+        .available => if (ui.button(ui.id("set-upd-view", 0), br, a.t.upd_view, .{ .style = .primary, .icon = icons.download, .size = 13 })) {
+            a.dialog = .update;
+        },
+        .downloading => {
+            ui.progressBar(.{ .x = ctrl.x + 60, .y = ctrl.y + 16, .w = ctrl.w - 60, .h = 5 }, updater.progress.get(), ui.colors.accent);
+            ui.spinner(.{ .x = ctrl.x + 40, .y = ctrl.y + 18 }, 8, ui.colors.accent);
+        },
+        .ready => if (ui.button(ui.id("set-upd-restart", 0), br, a.t.upd_restart, .{ .style = .primary, .icon = icons.refresh_cw, .size = 13 })) {
+            a.restartForUpdate();
+        },
+        else => if (ui.button(ui.id("set-upd-check", 0), br, a.t.upd_check_now, .{ .icon = icons.refresh_cw, .size = 13, .loading = st == .checking })) {
+            updater.check(false);
+        },
+    }
+    sectionEnd(l);
+}
+
+// ── Linux app menu ──────────────────────────────────────────────────────────
+
+fn installSection(a: *App, l: *Layout) void {
+    sectionHeader(l, icons.layout_grid, a.t.sec_install);
+    _ = card(l, 1, 0);
+    const on = a.desktopInstalled();
+    const desc = if (on and a.desktop_exe.len > 0) a.tf(a.t.inst_desc_on, .{a.desktop_exe}) else a.t.inst_desc_off;
+    const ctrl = row(l, a.t.inst_row, desc, true);
+    var bx = ctrl.right() - 130;
+    if (ui.button(ui.id("set-inst", 0), .{ .x = bx, .y = ctrl.y, .w = 130, .h = ctrl.h }, if (on) a.t.inst_reinstall else a.t.inst_install, .{ .style = if (on) .secondary else .primary, .icon = icons.download, .size = 13 })) {
+        a.installDesktop();
+    }
+    if (on) {
+        bx -= 44;
+        if (ui.iconButton(ui.id("set-uninst", 0), .{ .x = bx, .y = ctrl.y, .w = 38, .h = ctrl.h }, icons.trash_2, .{ .tooltip = a.t.inst_remove, .size = 15 })) {
+            a.uninstallDesktop();
+        }
+    }
+    sectionEnd(l);
 }
 
 // ── About ───────────────────────────────────────────────────────────────────

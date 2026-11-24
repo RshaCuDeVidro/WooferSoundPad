@@ -451,4 +451,139 @@ static void dsp_process(WoofDsp *d, const WoofFx *chain, int count, float *buf, 
     }
 }
 
+// ── Master bus ──────────────────────────────────────────────────────────────
+// Runs on the sum of every pad, once per output: EQ, compressor, limiter.
+
+typedef struct {
+    float b0, b1, b2, a1, a2;
+    float z1[WOOF_DSP_CH], z2[WOOF_DSP_CH];
+} WoofEqBand;
+
+typedef struct {
+    unsigned channels;
+    unsigned rate;
+    WoofEqBand eq[3]; // low shelf, mid peak, high shelf
+    float eq_db[3];   // what the coefficients were computed for
+    float comp_env;   // compressor envelope (linear peak)
+    float lim_gain;
+} WoofMasterDsp;
+
+static void master_init(WoofMasterDsp *m, unsigned channels, unsigned rate) {
+    memset(m, 0, sizeof(*m));
+    m->channels = channels < 1 ? 1 : (channels > WOOF_DSP_CH ? WOOF_DSP_CH : channels);
+    m->rate = rate > 0 ? rate : 48000;
+    m->lim_gain = 1;
+    for (int i = 0; i < 3; i++) m->eq_db[i] = NAN; // forces the first update
+}
+
+// RBJ cookbook shelves (S = 1) and peak
+static void eq_update(WoofEqBand *q, int band, float db, float rate) {
+    static const float f0s[3] = {120, 1000, 8000};
+    float A = powf(10.0f, db / 40.0f);
+    float w0 = 2 * WOOF_PI * f0s[band] / rate;
+    float cs = cosf(w0), sn = sinf(w0);
+    float b0, b1, b2, a0, a1, a2;
+    if (band == 1) {
+        float alpha = sn / (2 * 0.9f);
+        b0 = 1 + alpha * A;
+        b1 = -2 * cs;
+        b2 = 1 - alpha * A;
+        a0 = 1 + alpha / A;
+        a1 = -2 * cs;
+        a2 = 1 - alpha / A;
+    } else {
+        float alpha = sn / 2 * sqrtf(2);
+        float k = 2 * sqrtf(A) * alpha;
+        if (band == 0) {
+            b0 = A * ((A + 1) - (A - 1) * cs + k);
+            b1 = 2 * A * ((A - 1) - (A + 1) * cs);
+            b2 = A * ((A + 1) - (A - 1) * cs - k);
+            a0 = (A + 1) + (A - 1) * cs + k;
+            a1 = -2 * ((A - 1) + (A + 1) * cs);
+            a2 = (A + 1) + (A - 1) * cs - k;
+        } else {
+            b0 = A * ((A + 1) + (A - 1) * cs + k);
+            b1 = -2 * A * ((A - 1) + (A + 1) * cs);
+            b2 = A * ((A + 1) + (A - 1) * cs - k);
+            a0 = (A + 1) - (A - 1) * cs + k;
+            a1 = 2 * ((A - 1) - (A + 1) * cs);
+            a2 = (A + 1) - (A - 1) * cs - k;
+        }
+    }
+    q->b0 = b0 / a0;
+    q->b1 = b1 / a0;
+    q->b2 = b2 / a0;
+    q->a1 = a1 / a0;
+    q->a2 = a2 / a0;
+}
+
+static void master_process(WoofMasterDsp *m, const WoofMaster *p, float *buf, unsigned frames) {
+    const unsigned ch = m->channels;
+    const size_t n = (size_t)frames * ch;
+    const float db[3] = {dsp_clampf(p->eq_low, -12, 12), dsp_clampf(p->eq_mid, -12, 12), dsp_clampf(p->eq_high, -12, 12)};
+    for (int b = 0; b < 3; b++) {
+        if (db[b] != m->eq_db[b]) {
+            m->eq_db[b] = db[b];
+            eq_update(&m->eq[b], b, db[b], (float)m->rate);
+        }
+        if (fabsf(db[b]) < 0.05f) continue; // flat: skip, and keep the state quiet
+        WoofEqBand *q = &m->eq[b];
+        for (unsigned f = 0; f < frames; f++) {
+            float *frame = buf + (size_t)f * ch;
+            for (unsigned c = 0; c < ch; c++) {
+                float x = frame[c];
+                float y = q->b0 * x + q->z1[c];
+                q->z1[c] = q->b1 * x - q->a1 * y + q->z2[c];
+                q->z2[c] = q->b2 * x - q->a2 * y;
+                frame[c] = y;
+            }
+        }
+    }
+
+    // Compressor: stereo-linked peak follower, threshold and ratio from one knob
+    const float amount = dsp_clampf(p->comp, 0, 1);
+    if (amount > 0.01f) {
+        const float thr_db = -6 - 24 * amount;
+        const float ratio = 1.5f + 6 * amount;
+        const float makeup = powf(10.0f, -thr_db * (1 - 1 / ratio) * 0.5f / 20.0f);
+        const float thr = powf(10.0f, thr_db / 20.0f);
+        const float att = expf(-1.0f / (0.005f * (float)m->rate));
+        const float rel = expf(-1.0f / (0.12f * (float)m->rate));
+        for (unsigned f = 0; f < frames; f++) {
+            float *frame = buf + (size_t)f * ch;
+            float peak = 0;
+            for (unsigned c = 0; c < ch; c++) peak = fmaxf(peak, fabsf(frame[c]));
+            const float k = peak > m->comp_env ? att : rel;
+            m->comp_env = peak + k * (m->comp_env - peak);
+            float g = makeup;
+            if (m->comp_env > thr) g *= powf(m->comp_env / thr, 1 / ratio - 1);
+            for (unsigned c = 0; c < ch; c++) frame[c] *= g;
+        }
+    }
+
+    // Limiter: instant attack, ~80 ms release, so the sum never clips
+    if (p->limiter) {
+        const float ceiling = 0.97f;
+        const float rel = 1 - expf(-1.0f / (0.08f * (float)m->rate));
+        for (unsigned f = 0; f < frames; f++) {
+            float *frame = buf + (size_t)f * ch;
+            float peak = 0;
+            for (unsigned c = 0; c < ch; c++) peak = fmaxf(peak, fabsf(frame[c]));
+            m->lim_gain += (1 - m->lim_gain) * rel;
+            if (peak * m->lim_gain > ceiling) m->lim_gain = ceiling / peak;
+            for (unsigned c = 0; c < ch; c++) frame[c] *= m->lim_gain;
+        }
+    } else {
+        m->lim_gain = 1;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        if (!isfinite(buf[i])) {
+            memset(buf, 0, n * sizeof(float));
+            master_init(m, m->channels, m->rate);
+            return;
+        }
+    }
+}
+
 #endif

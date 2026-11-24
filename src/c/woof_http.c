@@ -321,17 +321,24 @@ static void *serve(void *arg) {
     return 0;
 }
 
-int woof_http_start(int port, int lan, const char *token) {
-    ensure_lock();
-    woof_http_stop();
-    snprintf(g_token, sizeof(g_token), "%s", token ? token : "");
 #ifdef _WIN32
+static int wsa_init(void) {
     static int wsa_ready;
     if (!wsa_ready) {
         WSADATA wsa;
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return -1;
         wsa_ready = 1;
     }
+    return 0;
+}
+#endif
+
+int woof_http_start(int port, int lan, const char *token) {
+    ensure_lock();
+    woof_http_stop();
+    snprintf(g_token, sizeof(g_token), "%s", token ? token : "");
+#ifdef _WIN32
+    if (wsa_init() != 0) return -1;
 #else
     signal(SIGPIPE, SIG_IGN); // a client closing early must not kill the app
 #endif
@@ -382,4 +389,28 @@ void woof_http_stop(void) {
 
 int woof_http_running(void) {
     return g_running ? 1 : 0;
+}
+
+int woof_http_lan_ip(char *out, int cap) {
+    if (out == NULL || cap < 16) return -1;
+#ifdef _WIN32
+    if (wsa_init() != 0) return -1;
+#endif
+    // Connecting a UDP socket sends nothing; it only picks the interface the
+    // default route goes through, whose address is what a phone can reach
+    sock_t s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == BAD_SOCK) return -1;
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons(53);
+    to.sin_addr.s_addr = htonl(0x08080808); // 8.8.8.8
+    struct sockaddr_in me;
+    socklen_t len = sizeof(me);
+    int ok = connect(s, (struct sockaddr *)&to, sizeof(to)) == 0 && getsockname(s, (struct sockaddr *)&me, &len) == 0;
+    close_sock(s);
+    if (!ok || me.sin_addr.s_addr == 0) return -1;
+    const unsigned char *b = (const unsigned char *)&me.sin_addr.s_addr;
+    snprintf(out, (size_t)cap, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    return 0;
 }

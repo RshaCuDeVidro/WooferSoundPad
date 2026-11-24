@@ -15,6 +15,9 @@ int woof_http_running(void);
 void woof_http_set_page(const char *path, const char *content_type, const char *body, int len);
 // JSON served at /api/state. Copied.
 void woof_http_set_state(const char *json, int len);
+// This computer's address on the local network (the interface the default
+// route uses), e.g. "192.168.1.23". Returns 0 on success.
+int woof_http_lan_ip(char *out, int cap);
 // Next queued command as "verb argument" (argument may be empty).
 // Returns its length, 0 when the queue is empty.
 int woof_http_poll(char *buf, int cap);

@@ -21,6 +21,12 @@ const fx = @import("fx.zig");
 const stats = @import("stats.zig");
 const loudness = @import("loudness.zig");
 const remote = @import("remote.zig");
+const updater = @import("update.zig");
+const desktop = @import("desktop.zig");
+const watch = @import("watch.zig");
+const slicer = @import("slicer.zig");
+const schedule = @import("schedule.zig");
+const transcribe = @import("transcribe.zig");
 
 const gpa = sys.gpa;
 pub const icons = ui.icons;
@@ -46,14 +52,16 @@ pub const Dialog = union(enum) {
     create_workspace,
     rename_workspace: usize,
     delete_workspace: usize,
-    delete_sound: usize,
     edit_sound: usize,
+    slice_sound: usize,
     download_media: void,
     record: void,
+    update: void,
+    install_app: void,
 };
 
 /// Which hotkey field is waiting for a key press
-pub const Capture = enum { none, pad, stop, pause, next, random, mute_voice };
+pub const Capture = enum { none, pad, stop, pause, next, random, mute_voice, global_fx };
 
 /// Global hotkey actions; sounds use `sound_base + index`
 pub const Action = struct {
@@ -62,10 +70,12 @@ pub const Action = struct {
     pub const next: u32 = 2;
     pub const random: u32 = 3;
     pub const mute_voice: u32 = 4;
+    pub const global_fx: u32 = 5;
     pub const sound_base: u32 = 16;
 };
 
 pub const EditorTab = enum { sound, effects, pad };
+pub const ScheduleMode = enum { off, every, daily };
 
 pub const Editor = struct {
     name: ui.TextField = .{},
@@ -97,6 +107,10 @@ pub const Editor = struct {
     add_menu: bool = false,
     /// Set by openEditor so the undo history starts fresh
     undo_reset: bool = true,
+    output: audio.Route = .both,
+    schedule_mode: ScheduleMode = .off,
+    schedule_every: u32 = 15,
+    schedule_time: ui.TextField = .{},
 
     pub fn hotkeyText(e: *const Editor) []const u8 {
         return e.hotkey[0..e.hotkey_len];
@@ -107,6 +121,17 @@ pub const Editor = struct {
         @memcpy(e.hotkey[0..e.hotkey_len], s[0..e.hotkey_len]);
     }
 };
+
+/// "Slice at silences" dialog
+pub const SliceState = struct {
+    pub const max_pieces = 99;
+    opts: slicer.Options = .{},
+    pieces: [max_pieces]slicer.Segment = undefined,
+    count: usize = 0,
+};
+
+/// A scheduled pad from another workspace, loaded just to play once
+const ExtraPlay = struct { id: c_int, started: f32 };
 
 /// Sounds waiting to play one after another
 pub const Queue = struct {
@@ -245,6 +270,36 @@ pub const App = struct {
     vmic_include_mic: bool = true,
 
     quit_requested: bool = false,
+    update_seen: updater.State = .idle,
+    update_popup: bool = false,
+    update_checked_at: f32 = 0,
+    settings_tab: usize = 0,
+    /// Linux app menu entry; null until looked up
+    desktop_installed: ?bool = null,
+    desktop_exe: []u8 = &.{},
+
+    /// Pads picked with Ctrl+click (uids in the active workspace)
+    selection: std.ArrayList(u32) = .empty,
+    /// The last delete, restorable until the next one
+    undo: std.ArrayList(library.Trashed) = .empty,
+    undo_id: u64 = 0,
+    watch_polled_at: f32 = 0,
+    schedule_polled_at: f32 = 0,
+    scheduled_extra: std.ArrayList(ExtraPlay) = .empty,
+    slice: SliceState = .{},
+    slice_task: ?*slicer.Task = null,
+    transcribe_task: ?*transcribe.Task = null,
+    transcribe_setup: ?*transcribe.Setup = null,
+    /// Sounds whisper choked on this session (ws name and uid hashed)
+    transcribe_failed: std.ArrayList(u64) = .empty,
+    /// Failures in a row; transcription pauses at 3
+    transcribe_failures: u32 = 0,
+    transcribe_polled_at: f32 = 0,
+    /// Global effect: held by its hotkey, latched by a button, or previewed
+    global_fx_held: bool = false,
+    global_fx_latched: bool = false,
+    global_fx_preview: bool = false,
+    global_fx_on: bool = false,
 
     // ── Setup ───────────────────────────────────────────────────────────────
 
@@ -260,11 +315,14 @@ pub const App = struct {
             std.log.warn("virtual mic device \"{s}\" not found", .{a.cfg.mic_device});
         }
         audio.applyVolumes(&a.cfg);
+        audio.applyMaster(&a.cfg);
+        a.applyGlobalFx();
 
         stats.load();
         a.openLibrary();
         tools.init();
         tools.detect(&a.cfg);
+        transcribe.detect(a.cfg.whisper_path);
         jobs.init();
         remote.apply(&a.cfg);
         if (a.cfg.global_hotkeys) hotkeys.start();
@@ -277,10 +335,17 @@ pub const App = struct {
         // pactl forgets loopback volumes when PipeWire restarts
         if (a.cfg.voice_volume != 1 or a.cfg.voice_muted) vmic.setVoice(a.cfg.voice_volume, a.cfg.voice_muted);
         a.rng ^= @bitCast(@as(i64, library.now()));
+        if (a.cfg.update_check and updater.auto_supported) updater.check(true);
     }
 
     pub fn deinit(a: *App) void {
         a.flushSaves();
+        a.finishUndo();
+        a.undo.deinit(gpa);
+        a.selection.deinit(gpa);
+        for (a.scheduled_extra.items) |e| audio.unload(e.id);
+        a.scheduled_extra.deinit(gpa);
+        a.transcribe_failed.deinit(gpa);
         remote.stop();
         hotkeys.stop();
         ipc.shutdown();
@@ -292,6 +357,7 @@ pub const App = struct {
         a.jobs.deinit();
         a.lib.deinit();
         stats.deinit();
+        gpa.free(a.desktop_exe);
     }
 
     fn libraryRoot(a: *const App) ![]u8 {
@@ -304,10 +370,15 @@ pub const App = struct {
         a.unloadWorkspaceAudio();
         const root = a.libraryRoot() catch return;
         defer gpa.free(root);
+        // The trash lives inside the workspaces, so a pending undo ends here
+        a.finishUndo();
+        a.selection.clearRetainingCapacity();
+        watch.reset();
         a.lib.open(root, a.t.default_workspace) catch |err| {
             ui.toastFmt(.err, "Library: {s}", .{@errorName(err)});
             return;
         };
+        a.lib.emptyTrash();
         a.ws = a.lib.find(a.cfg.active_workspace) orelse 0;
         a.loadWorkspaceAudio();
     }
@@ -336,6 +407,7 @@ pub const App = struct {
         }
         audio.setParams(s.audio_id, s.params());
         audio.setFx(s.audio_id, &s.fx);
+        audio.setRoute(s.audio_id, s.output);
     }
 
     fn unloadWorkspaceAudio(a: *App) void {
@@ -362,6 +434,9 @@ pub const App = struct {
         config.setString(&a.cfg.active_workspace, a.workspace().name);
         a.markConfig();
         a.search.clear();
+        a.selection.clearRetainingCapacity();
+        // The editor and slicer point at pads by index
+        a.closeSoundDialogs();
         a.loadWorkspaceAudio();
     }
 
@@ -399,6 +474,8 @@ pub const App = struct {
     }
 
     pub fn deleteWorkspace(a: *App, idx: usize) void {
+        a.finishUndo();
+        a.selection.clearRetainingCapacity();
         if (idx == a.ws) {
             a.queueClear();
             a.unloadWorkspaceAudio();
@@ -793,6 +870,9 @@ pub const App = struct {
         copy.volume = original.volume;
         copy.setParams(original.params());
         copy.fx = original.fx;
+        copy.output = original.output;
+        copy.setTranscript(original.transcript) catch {};
+        copy.transcribed = original.transcribed;
         a.lib.save(a.ws) catch {};
         a.loadSound(a.workspace(), copy);
         ui.toast(.success, a.t.duplicated);
@@ -825,11 +905,195 @@ pub const App = struct {
     }
 
     pub fn deleteSound(a: *App, idx: usize) void {
+        a.deleteSounds(&.{idx});
+    }
+
+    /// Deletes pads right away and offers an undo. `indices` highest first.
+    pub fn deleteSounds(a: *App, indices: []const usize) void {
+        if (indices.len == 0) return;
+        a.finishUndo();
+        a.closeSoundDialogs();
+        a.menu = null;
         const ws = a.workspace();
-        if (idx >= ws.sounds.items.len) return;
-        audio.unload(ws.sounds.items[idx].audio_id);
-        a.lib.removeSound(a.ws, idx, true);
+        var name_buf: [120]u8 = undefined;
+        var name: []const u8 = "";
+        for (indices) |idx| {
+            if (idx >= ws.sounds.items.len) continue;
+            const s = &ws.sounds.items[idx];
+            const n = @min(s.name.len, name_buf.len);
+            @memcpy(name_buf[0..n], s.name[0..n]);
+            name = name_buf[0..n];
+            audio.unload(s.audio_id);
+            s.audio_id = -1;
+            a.queueForget(s.uid);
+            const t = a.lib.trashSound(a.ws, idx) catch |err| {
+                ui.toastFmt(.err, "{s}", .{@errorName(err)});
+                a.loadSound(ws, s);
+                continue;
+            };
+            a.undo.append(gpa, t) catch {
+                var lost = t;
+                lost.deinit();
+            };
+        }
         a.bindings_dirty = true;
+        const n = a.undo.items.len;
+        if (n == 0) return;
+        a.undo_id +%= 1;
+        const msg = if (n == 1) a.tf(a.t.sound_deleted, .{name}) else a.tf(a.t.sounds_deleted, .{n});
+        ui.toastAction(.info, msg, a.t.undo, a.undo_id, 8);
+    }
+
+    /// Brings back what the last delete took (Ctrl+Z or the toast's button)
+    pub fn undoDelete(a: *App) void {
+        ui.dismissAction(a.undo_id);
+        var restored: usize = 0;
+        var name: []const u8 = "";
+        // Last trashed first, so every pad lands back at its old position
+        while (a.undo.pop()) |item| {
+            var t = item;
+            const ws_idx = a.lib.find(t.ws_name);
+            const at = a.lib.restore(&t) catch |err| {
+                ui.toastFmt(.err, "{s}", .{@errorName(err)});
+                t.deinit();
+                continue;
+            };
+            if (ws_idx) |wi| {
+                const back = &a.lib.workspaces.items[wi].sounds.items[at];
+                name = a.tf("{}", .{back.name});
+                if (wi == a.ws) a.loadSound(a.workspace(), back);
+            }
+            restored += 1;
+        }
+        a.bindings_dirty = true;
+        if (restored == 1) ui.toast(.success, a.tf(a.t.restored_one, .{name}));
+        if (restored > 1) ui.toast(.success, a.tf(a.t.restored_n, .{restored}));
+    }
+
+    /// The undo window closed: the deleted files go for good
+    fn finishUndo(a: *App) void {
+        for (a.undo.items) |*t| t.deinit();
+        a.undo.clearRetainingCapacity();
+        ui.dismissAction(a.undo_id);
+    }
+
+    /// Dialogs that hold a pad index can't survive the pads moving under them
+    pub fn closeSoundDialogs(a: *App) void {
+        switch (a.dialog) {
+            .edit_sound => |i| {
+                if (!a.editor.saved) a.cancelEditor(i);
+                a.dialog = .none;
+            },
+            .slice_sound => a.dialog = .none,
+            else => {},
+        }
+        switch (a.dialog_closing) {
+            .edit_sound, .slice_sound => a.dialog_closing = .none,
+            else => {},
+        }
+    }
+
+    // ── Selection ───────────────────────────────────────────────────────────
+
+    pub fn isSelected(a: *const App, uid: u32) bool {
+        return std.mem.indexOfScalar(u32, a.selection.items, uid) != null;
+    }
+
+    pub fn toggleSelected(a: *App, uid: u32) void {
+        if (std.mem.indexOfScalar(u32, a.selection.items, uid)) |i| {
+            _ = a.selection.orderedRemove(i);
+        } else a.selection.append(gpa, uid) catch {};
+    }
+
+    /// Every pad the search and filters show
+    pub fn selectAll(a: *App) void {
+        a.selection.clearRetainingCapacity();
+        const ws = a.workspace();
+        for (a.view.items) |i| a.selection.append(gpa, ws.sounds.items[i].uid) catch {};
+    }
+
+    /// Indices of the selected pads, highest first (safe to remove in that order)
+    fn selectedIndices(a: *App, out: *std.ArrayList(usize)) void {
+        out.clearRetainingCapacity();
+        const ws = a.workspace();
+        var i = ws.sounds.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (a.isSelected(ws.sounds.items[i].uid)) out.append(gpa, i) catch {};
+        }
+    }
+
+    pub fn deleteSelected(a: *App) void {
+        var list: std.ArrayList(usize) = .empty;
+        defer list.deinit(gpa);
+        a.selectedIndices(&list);
+        a.deleteSounds(list.items);
+        a.selection.clearRetainingCapacity();
+    }
+
+    pub fn moveSelected(a: *App, to: usize) void {
+        if (to == a.ws or to >= a.lib.workspaces.items.len) return;
+        // In pad order, so they arrive in the same order
+        var uids: std.ArrayList(u32) = .empty;
+        defer uids.deinit(gpa);
+        for (a.workspace().sounds.items) |s| {
+            if (a.isSelected(s.uid)) uids.append(gpa, s.uid) catch {};
+        }
+        var moved: usize = 0;
+        for (uids.items) |uid| {
+            const ws = a.workspace();
+            const idx = ws.findByUid(uid) orelse continue;
+            audio.unload(ws.sounds.items[idx].audio_id);
+            ws.sounds.items[idx].audio_id = -1;
+            a.queueForget(uid);
+            a.lib.moveSound(a.ws, idx, to) catch |err| {
+                ui.toastFmt(.err, "{s}", .{@errorName(err)});
+                a.loadSound(ws, &ws.sounds.items[idx]);
+                continue;
+            };
+            moved += 1;
+        }
+        a.selection.clearRetainingCapacity();
+        a.bindings_dirty = true;
+        if (moved == 1) ui.toast(.success, a.tf(a.t.sound_moved, .{a.lib.workspaces.items[to].name}));
+        if (moved > 1) ui.toast(.success, a.tf(a.t.sounds_moved, .{ moved, a.lib.workspaces.items[to].name }));
+    }
+
+    pub fn setSelectedVolume(a: *App, volume: f32) void {
+        for (a.workspace().sounds.items) |*s| {
+            if (a.isSelected(s.uid)) s.volume = volume;
+        }
+        a.markWorkspace();
+    }
+
+    pub fn setSelectedOutput(a: *App, route: audio.Route) void {
+        for (a.workspace().sounds.items) |*s| {
+            if (!a.isSelected(s.uid)) continue;
+            s.output = route;
+            audio.setRoute(s.audio_id, route);
+        }
+        a.markWorkspace();
+    }
+
+    pub fn setSelectedFx(a: *App, chain: fx.Chain) void {
+        for (a.workspace().sounds.items) |*s| {
+            if (!a.isSelected(s.uid)) continue;
+            s.fx = chain;
+            audio.setFx(s.audio_id, &s.fx);
+        }
+        a.markWorkspace();
+    }
+
+    /// Stars them all, or clears the star when every one already has it
+    pub fn favoriteSelected(a: *App) void {
+        var all = true;
+        for (a.workspace().sounds.items) |s| {
+            if (a.isSelected(s.uid) and !s.favorite) all = false;
+        }
+        for (a.workspace().sounds.items) |*s| {
+            if (a.isSelected(s.uid)) s.favorite = !all;
+        }
+        a.markWorkspace();
     }
 
     pub fn moveSound(a: *App, idx: usize, to: usize) void {
@@ -860,6 +1124,11 @@ pub const App = struct {
         a.editor.original = s.params();
         a.editor.fx = s.fx;
         a.editor.original_fx = s.fx;
+        a.editor.output = s.output;
+        a.editor.schedule_mode = if (s.schedule_every > 0) .every else if (s.schedule_at >= 0) .daily else .off;
+        if (s.schedule_every > 0) a.editor.schedule_every = s.schedule_every;
+        var time_buf: [8]u8 = undefined;
+        a.editor.schedule_time.set(schedule.formatTime(&time_buf, if (s.schedule_at >= 0) s.schedule_at else 9 * 60));
         a.editor.view_len = 0; // fit on first draw
         a.capture = .none;
         a.dialog = .{ .edit_sound = idx };
@@ -900,8 +1169,15 @@ pub const App = struct {
         s.setHotkey(a.editor.hotkeyText()) catch {};
         s.setParams(a.editor.params);
         s.fx = a.editor.fx;
+        s.output = a.editor.output;
+        s.schedule_every = if (a.editor.schedule_mode == .every) std.math.clamp(a.editor.schedule_every, 1, 24 * 60) else 0;
+        s.schedule_at = if (a.editor.schedule_mode == .daily) (schedule.parseTime(a.editor.schedule_time.text()) orelse 9 * 60) else -1;
+        // Re-armed from now
+        s.next_fire = 0;
+        s.fired_day = 0;
         audio.setParams(s.audio_id, s.params());
         audio.setFx(s.audio_id, &s.fx);
+        audio.setRoute(s.audio_id, s.output);
         a.editor.saved = true;
         a.lib.save(a.ws) catch {};
         a.bindings_dirty = true;
@@ -1252,7 +1528,363 @@ pub const App = struct {
 
         a.updateRemote();
         a.updateHotkeys();
+        a.updateGlobalFx();
         a.updateSaves();
+        a.updateUpdater();
+        a.pollSlice();
+        a.updateWatch();
+        a.updateSchedules();
+        a.updateTranscription();
+        if (ui.takenAction()) |id| {
+            if (id == a.undo_id) a.undoDelete();
+        }
+    }
+
+    // ── Global effect ───────────────────────────────────────────────────────
+
+    /// The chain the global-effect key lays over everything
+    pub fn globalFxChain(a: *const App) fx.Chain {
+        const p = a.cfg.global_fx_preset;
+        if (p.len > 1 and p[0] == '@') {
+            const i = std.fmt.parseInt(usize, p[1..], 10) catch 3;
+            if (i < fx.builtins.len) return fx.Chain.fromSlice(fx.builtins[i].effects);
+        }
+        for (a.cfg.fx_presets) |up| {
+            if (std.mem.eql(u8, up.name, p)) return fx.Chain.fromStored(up.fx);
+        }
+        return fx.Chain.fromSlice(fx.builtins[3].effects);
+    }
+
+    pub fn applyGlobalFx(a: *App) void {
+        const chain = a.globalFxChain();
+        audio.setGlobalFx(&chain);
+    }
+
+    /// On while its key is held down, while latched, or while the settings preview is pressed
+    fn updateGlobalFx(a: *App) void {
+        if (a.global_fx_held) {
+            const hk = hotkeys.parse(a.cfg.global_fx_hotkey);
+            if (hk == null or !hotkeys.isDown(hk.?, c.IsWindowFocused())) a.global_fx_held = false;
+        }
+        const on = a.global_fx_held or a.global_fx_latched or a.global_fx_preview;
+        a.global_fx_preview = false; // the settings button sets it again every frame it is pressed
+        if (on != a.global_fx_on) {
+            a.global_fx_on = on;
+            audio.setGlobalFxOn(on);
+        }
+    }
+
+    // ── Watched folders ─────────────────────────────────────────────────────
+
+    fn updateWatch(a: *App) void {
+        // The slicer writes into the folder; its pieces are adopted in order when it ends
+        if (!a.cfg.watch_folders or a.slice_task != null) return;
+        if (ui.time - a.watch_polled_at < watch.interval) return;
+        a.watch_polled_at = ui.time;
+        var events: std.ArrayList(watch.Event) = .empty;
+        defer {
+            watch.freeEvents(&events);
+            events.deinit(gpa);
+        }
+        watch.poll(&a.lib, &a.jobs, &events);
+        var added: usize = 0;
+        var added_name: []const u8 = "";
+        for (events.items) |e| switch (e.kind) {
+            .added => {
+                const idx = a.lib.adopt(e.ws, e.file, library.stem(e.file), "") catch continue;
+                if (e.ws == a.ws) a.loadSound(a.workspace(), &a.workspace().sounds.items[idx]);
+                added_name = a.tf("{}", .{library.stem(e.file)});
+                added += 1;
+            },
+            .removed => {
+                const ws = &a.lib.workspaces.items[e.ws];
+                const idx = ws.findByUid(e.uid) orelse continue;
+                if (e.ws == a.ws) {
+                    audio.unload(ws.sounds.items[idx].audio_id);
+                    a.queueForget(e.uid);
+                    a.closeSoundDialogs();
+                    a.menu = null;
+                }
+                a.lib.removeSound(e.ws, idx, false);
+            },
+        };
+        if (events.items.len > 0) a.bindings_dirty = true;
+        if (added == 1) ui.toast(.info, a.tf(a.t.watch_added_one, .{added_name}));
+        if (added > 1) ui.toast(.info, a.tf(a.t.watch_added, .{added}));
+    }
+
+    // ── Schedules ───────────────────────────────────────────────────────────
+
+    fn updateSchedules(a: *App) void {
+        // Pads borrowed from other workspaces go once they are done
+        var i: usize = 0;
+        while (i < a.scheduled_extra.items.len) {
+            const e = a.scheduled_extra.items[i];
+            if (ui.time - e.started < 2 or audio.isPlaying(e.id) or audio.isPaused(e.id)) {
+                i += 1;
+                continue;
+            }
+            audio.unload(e.id);
+            _ = a.scheduled_extra.swapRemove(i);
+        }
+        if (ui.time - a.schedule_polled_at < 1) return;
+        a.schedule_polled_at = ui.time;
+        const clock: schedule.Clock = .{ .now = library.now(), .utc_offset = c.woof_utc_offset() };
+        for (a.lib.workspaces.items, 0..) |*ws, wi| {
+            for (ws.sounds.items, 0..) |*s, si| {
+                if (!s.scheduled()) continue;
+                if (!schedule.tick(s.schedule_every, s.schedule_at, &s.next_fire, &s.fired_day, clock)) continue;
+                if (wi == a.ws) a.playNow(si) else a.playBorrowed(ws, s);
+            }
+        }
+    }
+
+    fn playBorrowed(a: *App, ws: *library.Workspace, s: *library.Sound) void {
+        const path = ws.soundPath(s) catch return;
+        defer gpa.free(path);
+        const id = audio.load(path);
+        if (id < 0) return;
+        audio.setParams(id, s.params());
+        audio.setFx(id, &s.fx);
+        audio.setRoute(id, s.output);
+        audio.play(id, a.padVolume(s, s.volume), .restart);
+        a.scheduled_extra.append(gpa, .{ .id = id, .started = ui.time }) catch audio.unload(id);
+    }
+
+    // ── Slicing ─────────────────────────────────────────────────────────────
+
+    pub fn openSlicer(a: *App, idx: usize) void {
+        a.slice = .{};
+        a.menu = null;
+        a.dialog = .{ .slice_sound = idx };
+    }
+
+    pub fn startSlice(a: *App, idx: usize) void {
+        const ws = a.workspace();
+        if (a.slice_task != null or a.slice.count == 0 or idx >= ws.sounds.items.len) return;
+        const s = &ws.sounds.items[idx];
+        const path = ws.soundPath(s) catch return;
+        defer gpa.free(path);
+        a.slice_task = slicer.Task.start(path, ws.dir, s.name, ws.name, s.uid, a.slice.pieces[0..a.slice.count]) catch |err| {
+            ui.toastFmt(.err, "{s}", .{@errorName(err)});
+            return;
+        };
+    }
+
+    /// The pieces become pads right after the sliced one, in order
+    fn pollSlice(a: *App) void {
+        const t = a.slice_task orelse return;
+        if (t.state.load(.acquire) != .done) return;
+        defer {
+            t.free();
+            a.slice_task = null;
+        }
+        const ws_idx = a.lib.find(t.ws_name) orelse return;
+        const ws = &a.lib.workspaces.items[ws_idx];
+        const original = ws.findByUid(t.uid);
+        const color = if (original) |o| ws.sounds.items[o].color else 0;
+        var at = if (original) |o| o + 1 else ws.sounds.items.len;
+        var made: usize = 0;
+        for (t.files) |f| {
+            const name = f orelse continue;
+            const idx = a.lib.adopt(ws_idx, name, library.stem(name), "") catch continue;
+            var piece = ws.sounds.orderedRemove(idx);
+            if (color != 0) piece.color = color;
+            at = @min(at, ws.sounds.items.len);
+            ws.sounds.insert(gpa, at, piece) catch {
+                ws.sounds.append(gpa, piece) catch continue;
+                at = ws.sounds.items.len - 1;
+            };
+            if (ws_idx == a.ws) a.loadSound(ws, &ws.sounds.items[at]);
+            at += 1;
+            made += 1;
+        }
+        a.lib.save(ws_idx) catch {};
+        a.bindings_dirty = true;
+        if (made > 0) ui.toast(.success, a.tf(a.t.slice_done, .{made})) else ui.toast(.err, a.t.slice_failed);
+    }
+
+    // ── Transcription ───────────────────────────────────────────────────────
+
+    fn transcribeKey(ws_name: []const u8, uid: u32) u64 {
+        return std.hash.Wyhash.hash(uid, ws_name);
+    }
+
+    pub fn startWhisperSetup(a: *App) void {
+        if (a.transcribe_setup != null) return;
+        a.transcribe_setup = transcribe.Setup.start() catch |err| {
+            ui.toastFmt(.err, "{s}", .{@errorName(err)});
+            return;
+        };
+    }
+
+    /// Clears every transcript so whisper goes over the library again
+    pub fn retranscribeAll(a: *App) void {
+        for (a.lib.workspaces.items, 0..) |*ws, wi| {
+            for (ws.sounds.items) |*s| {
+                s.setTranscript("") catch {};
+                s.transcribed = false;
+            }
+            a.lib.save(wi) catch {};
+        }
+        a.transcribe_failed.clearRetainingCapacity();
+        a.transcribe_failures = 0;
+    }
+
+    pub fn resumeTranscription(a: *App) void {
+        a.transcribe_failed.clearRetainingCapacity();
+        a.transcribe_failures = 0;
+    }
+
+    pub fn transcribeProgress(a: *App) struct { done: usize, total: usize } {
+        var done: usize = 0;
+        var total: usize = 0;
+        for (a.lib.workspaces.items) |ws| {
+            for (ws.sounds.items) |s| {
+                total += 1;
+                if (s.transcribed) done += 1;
+            }
+        }
+        return .{ .done = done, .total = total };
+    }
+
+    pub fn transcribeStalled(a: *const App) bool {
+        return a.transcribe_failures >= 3;
+    }
+
+    fn updateTranscription(a: *App) void {
+        if (a.transcribe_setup) |setup| switch (setup.state.load(.acquire)) {
+            .running => {},
+            .done, .failed => |st| {
+                setup.free();
+                a.transcribe_setup = null;
+                transcribe.detect(a.cfg.whisper_path);
+                if (st == .done) ui.toast(.success, a.t.tr_setup_done) else ui.toast(.err, a.t.tr_setup_failed);
+            },
+        };
+        if (a.transcribe_task) |t| {
+            const st = t.state.load(.acquire);
+            if (st == .running) return;
+            defer {
+                t.free();
+                a.transcribe_task = null;
+            }
+            const ws_idx = a.lib.find(t.ws_name) orelse return;
+            const ws = &a.lib.workspaces.items[ws_idx];
+            const idx = ws.findByUid(t.uid) orelse return;
+            if (st == .done) {
+                ws.sounds.items[idx].setTranscript(t.text) catch return;
+                if (ws_idx == a.ws) a.markWorkspace() else a.lib.save(ws_idx) catch {};
+                a.transcribe_failures = 0;
+            } else {
+                a.transcribe_failed.append(gpa, transcribeKey(t.ws_name, t.uid)) catch {};
+                a.transcribe_failures += 1;
+            }
+            return;
+        }
+        if (!a.cfg.transcribe or a.transcribeStalled() or !transcribe.ready()) return;
+        if (ui.time - a.transcribe_polled_at < 0.5) return;
+        a.transcribe_polled_at = ui.time;
+        // The active workspace first, then the rest
+        const n = a.lib.workspaces.items.len;
+        for (0..n) |k| {
+            const wi = (a.ws + k) % n;
+            const ws = &a.lib.workspaces.items[wi];
+            for (ws.sounds.items) |*s| {
+                if (s.transcribed) continue;
+                if (std.mem.indexOfScalar(u64, a.transcribe_failed.items, transcribeKey(ws.name, s.uid)) != null) continue;
+                const path = ws.soundPath(s) catch return;
+                defer gpa.free(path);
+                a.transcribe_task = transcribe.Task.start(path, ws.name, s.uid) catch return;
+                return;
+            }
+        }
+    }
+
+    /// Reacts to the background update check and pops the dialog when idle
+    fn updateUpdater(a: *App) void {
+        const st = updater.state.load(.acquire);
+        if (st != a.update_seen) {
+            a.update_seen = st;
+            switch (st) {
+                .checking => a.update_checked_at = ui.time,
+                .available => {
+                    const skipped = std.mem.eql(u8, a.cfg.update_skip, updater.latestVersion());
+                    if (!updater.automatic or !skipped) a.update_popup = true;
+                },
+                .up_to_date => if (!updater.automatic) ui.toast(.success, a.t.upd_latest),
+                .ready => if (a.dialog != .update) ui.toast(.success, a.tf(a.t.upd_ready, .{updater.latestVersion()})),
+                .failed => if (a.dialog != .update and (!updater.automatic or updater.failed_install)) {
+                    ui.toast(.err, a.tf(a.t.upd_failed, .{a.updateFailureText()}));
+                },
+                else => {},
+            }
+        }
+        // Long sessions look again twice a day
+        const twelve_hours = 12 * 3600;
+        if (a.cfg.update_check and updater.auto_supported and ui.time - a.update_checked_at > twelve_hours and
+            (st == .up_to_date or st == .failed)) updater.check(true);
+
+        // Linux: offer the app menu entry once, after the tour
+        if (desktop.supported and updater.auto_supported and !a.cfg.install_prompted and a.dialog == .none and
+            a.dialog_closing == .none and !a.stage and !a.onboarding_open)
+        {
+            a.cfg.install_prompted = true;
+            a.markConfig();
+            if (!a.desktopInstalled()) a.dialog = .install_app;
+        }
+
+        if (a.update_popup and a.dialog == .none and a.dialog_closing == .none and !a.stage and !a.onboarding_open) {
+            a.update_popup = false;
+            if (updater.state.load(.acquire) == .available) a.dialog = .update;
+        }
+    }
+
+    pub fn updateFailureText(a: *App) []const u8 {
+        return switch (updater.failure) {
+            .network => a.t.upd_err_network,
+            .no_asset => a.t.upd_err_no_asset,
+            .not_writable => a.t.upd_err_not_writable,
+            .checksum => a.t.upd_err_checksum,
+            .bad_binary => a.t.upd_err_bad_binary,
+            .none, .other => a.t.upd_err_other,
+        };
+    }
+
+    pub fn desktopInstalled(a: *App) bool {
+        if (a.desktop_installed == null) {
+            a.desktop_installed = desktop.installed();
+            gpa.free(a.desktop_exe);
+            a.desktop_exe = desktop.installedExe() orelse &.{};
+        }
+        return a.desktop_installed.?;
+    }
+
+    pub fn installDesktop(a: *App) void {
+        a.desktop_installed = null;
+        const res = desktop.install() catch |err| {
+            ui.toast(.err, a.tf(a.t.inst_failed, .{@errorName(err)}));
+            return;
+        };
+        defer gpa.free(res.exe);
+        if (res.copied) {
+            ui.toast(.success, a.tf(a.t.inst_done_copied, .{std.fs.path.dirname(res.exe) orelse res.exe}));
+        } else ui.toast(.success, a.t.inst_done);
+    }
+
+    pub fn uninstallDesktop(a: *App) void {
+        a.desktop_installed = null;
+        desktop.uninstall() catch |err| {
+            ui.toast(.err, a.tf(a.t.inst_failed, .{@errorName(err)}));
+            return;
+        };
+        ui.toast(.success, a.t.inst_removed);
+    }
+
+    /// "Restart now": quit, and main starts the new version
+    pub fn restartForUpdate(a: *App) void {
+        updater.relaunch_pending = true;
+        a.quit_requested = true;
     }
 
     // ── OBS / Stream Deck ───────────────────────────────────────────────────
@@ -1513,6 +2145,7 @@ pub const App = struct {
             .{ .text = a.cfg.next_hotkey, .action = Action.next },
             .{ .text = a.cfg.random_hotkey, .action = Action.random },
             .{ .text = a.cfg.mute_voice_hotkey, .action = Action.mute_voice },
+            .{ .text = a.cfg.global_fx_hotkey, .action = Action.global_fx },
         };
         for (globals) |g| {
             if (hotkeys.parse(g.text)) |hk| a.bindings.append(gpa, .{ .hotkey = hk, .action = g.action }) catch {};
@@ -1535,6 +2168,7 @@ pub const App = struct {
             Action.next => a.queueNext(),
             Action.random => a.playRandom(),
             Action.mute_voice => a.toggleVoiceMute(),
+            Action.global_fx => a.global_fx_held = true,
             else => if (action >= Action.sound_base) a.playSound(action - Action.sound_base),
         }
     }
@@ -1556,7 +2190,12 @@ pub const App = struct {
             if (hotkeys.pressedLocal(b.hotkey)) a.runAction(b.action);
         }
         const no_overlay = a.dialog == .none and a.menu == null and !a.onboarding_open;
-        if (no_overlay and c.IsKeyPressed(c.KEY_ESCAPE)) a.stopAll();
+        const on_pads = no_overlay and a.page == .soundboard and !a.stage;
+        if (no_overlay and c.IsKeyPressed(c.KEY_ESCAPE)) {
+            // Esc first lets go of a selection, then stops the sounds
+            if (on_pads and a.selection.items.len > 0) a.selection.clearRetainingCapacity() else a.stopAll();
+        }
+        if (on_pads and a.selection.items.len > 0 and c.IsKeyPressed(c.KEY_DELETE)) a.deleteSelected();
         if (no_overlay and !a.space_bound and c.IsKeyPressed(c.KEY_SPACE)) a.togglePause();
         const ctrl = c.IsKeyDown(c.KEY_LEFT_CONTROL) or c.IsKeyDown(c.KEY_RIGHT_CONTROL);
         if (ctrl) {
@@ -1565,6 +2204,8 @@ pub const App = struct {
                 if (c.IsKeyPressed(c.KEY_ONE + @as(c_int, @intCast(i)))) a.goto(p);
             }
             if (c.IsKeyPressed(c.KEY_F) and a.page == .soundboard) a.focus_search = true;
+            if (c.IsKeyPressed(c.KEY_A) and on_pads) a.selectAll();
+            if (c.IsKeyPressed(c.KEY_Z) and on_pads and a.undo.items.len > 0) a.undoDelete();
             if (c.IsKeyPressed(c.KEY_O) and a.page == .soundboard) a.openImportDialog();
             return;
         }

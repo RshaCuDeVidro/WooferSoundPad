@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const os = target.result.os.tag;
-    const version = b.option([]const u8, "version", "Version string shown in the app") orelse "1.0.0";
+    const version = b.option([]const u8, "version", "Version string shown in the app") orelse "1.1.0";
 
     if (os != .linux and os != .windows) @panic("WooferSoundPad supports Linux and Windows only");
 
@@ -76,6 +76,9 @@ pub fn build(b: *std.Build) void {
         },
     });
     exe_mod.addOptions("build_options", build_options);
+    // The changelog is shown in Settings
+    exe_mod.addAnonymousImport("changelog_en", .{ .root_source_file = b.path("CHANGELOG.md") });
+    exe_mod.addAnonymousImport("changelog_pt", .{ .root_source_file = b.path("CHANGELOG.pt-BR.md") });
     exe_mod.addIncludePath(b.path("vendor/raylib"));
     exe_mod.addIncludePath(b.path("vendor/tinyfiledialogs"));
     exe_mod.addIncludePath(b.path("src/c"));
@@ -126,6 +129,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    test_mod.addOptions("build_options", build_options);
+    test_mod.addImport("assets", assets_mod);
+    test_mod.addAnonymousImport("changelog_en", .{ .root_source_file = b.path("CHANGELOG.md") });
+    test_mod.addAnonymousImport("changelog_pt", .{ .root_source_file = b.path("CHANGELOG.pt-BR.md") });
     const tests = b.addTest(.{ .root_module = test_mod });
     const test_step = b.step("test", "Run unit tests (parsers, config)");
     test_step.dependOn(&b.addRunArtifact(tests).step);

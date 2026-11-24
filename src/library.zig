@@ -45,17 +45,42 @@ pub const Sound = struct {
     /// Measured loudness in dB (0 = not measured yet, 1 = can't be measured)
     loudness: f32 = 0,
     peak_db: f32 = 0,
+    /// Where it is heard: both outputs, only your headphones or only the virtual mic
+    output: audio.Route = .both,
+    /// Plays by itself every N minutes (0 = off)...
+    schedule_every: u32 = 0,
+    /// ...or every day at this minute of the day, local time (-1 = off)
+    schedule_at: i32 = -1,
+    /// What is said in it (whisper.cpp), for search
+    transcript: []u8 = &.{},
+    transcribed: bool = false,
 
     // Runtime only
     audio_id: c_int = -1,
     /// Smoothed output level for meters (0..1)
     level: f32 = 0,
+    /// When an "every N minutes" schedule fires next (unix seconds, 0 = not armed)
+    next_fire: i64 = 0,
+    /// Local day number a daily schedule last fired on
+    fired_day: i64 = 0,
 
     fn deinit(s: *Sound) void {
         gpa.free(s.file);
         gpa.free(s.name);
         gpa.free(s.hotkey);
         gpa.free(s.source);
+        gpa.free(s.transcript);
+    }
+
+    pub fn setTranscript(s: *Sound, text: []const u8) !void {
+        const copy = try gpa.dupe(u8, text);
+        gpa.free(s.transcript);
+        s.transcript = copy;
+        s.transcribed = true;
+    }
+
+    pub fn scheduled(s: *const Sound) bool {
+        return s.schedule_every > 0 or s.schedule_at >= 0;
     }
 
     pub fn setName(s: *Sound, name: []const u8) !void {
@@ -179,6 +204,11 @@ const SoundJson = struct {
     last_played: i64 = 0,
     loudness: f32 = 0,
     peak_db: f32 = 0,
+    output: audio.Route = .both,
+    schedule_every: u32 = 0,
+    schedule_at: i32 = -1,
+    transcript: []const u8 = "",
+    transcribed: bool = false,
 };
 
 const WorkspaceJson = struct {
@@ -214,7 +244,7 @@ pub const Library = struct {
         const entries = try sys.listDir(root);
         defer sys.freeEntries(entries);
         for (entries) |e| {
-            if (!e.is_dir) continue;
+            if (!e.is_dir or e.name[0] == '.') continue;
             lib.loadWorkspace(e.name) catch |err| {
                 std.log.warn("skipping workspace {s}: {s}", .{ e.name, @errorName(err) });
             };
@@ -272,6 +302,11 @@ pub const Library = struct {
                         .last_played = sj.last_played,
                         .loudness = if (std.math.isFinite(sj.loudness)) std.math.clamp(sj.loudness, -100, 1) else 0,
                         .peak_db = if (std.math.isFinite(sj.peak_db)) std.math.clamp(sj.peak_db, -100, 6) else 0,
+                        .output = sj.output,
+                        .schedule_every = @min(sj.schedule_every, 24 * 60),
+                        .schedule_at = if (sj.schedule_at >= 0 and sj.schedule_at < 24 * 60) sj.schedule_at else -1,
+                        .transcript = try gpa.dupe(u8, sj.transcript),
+                        .transcribed = sj.transcribed,
                     });
                 }
             } else |err| std.log.warn("{s}: {s}", .{ meta_path, @errorName(err) });
@@ -383,6 +418,11 @@ pub const Library = struct {
                 .last_played = s.last_played,
                 .loudness = s.loudness,
                 .peak_db = s.peak_db,
+                .output = s.output,
+                .schedule_every = s.schedule_every,
+                .schedule_at = s.schedule_at,
+                .transcript = s.transcript,
+                .transcribed = s.transcribed,
             };
         }
         const doc: WorkspaceJson = .{ .icon = ws.icon, .color = ws.color, .sounds = sounds };
@@ -437,9 +477,12 @@ pub const Library = struct {
             .fx = chain,
             .loudness = src.loudness,
             .peak_db = src.peak_db,
+            .output = src.output,
+            .transcribed = src.transcribed,
         };
-        v.setParams(src.params());
         errdefer v.deinit();
+        v.transcript = try gpa.dupe(u8, src.transcript);
+        v.setParams(src.params());
         try ws.sounds.insert(gpa, sound_idx + 1, v);
         lib.save(idx) catch {};
         return sound_idx + 1;
@@ -491,6 +534,91 @@ pub const Library = struct {
         try dst_ws.sounds.append(gpa, moved);
         lib.save(from) catch {};
         lib.save(to) catch {};
+    }
+
+    /// Takes a pad out and parks its file in the workspace's trash folder (a
+    /// rename, so it is instant), ready for `restore`. Variants keep the file.
+    pub fn trashSound(lib: *Library, idx: usize, sound_idx: usize) !Trashed {
+        const ws = &lib.workspaces.items[idx];
+        const s = ws.sounds.items[sound_idx];
+        var parked: ?[]u8 = null;
+        if (ws.fileUsers(s.file) == 1) {
+            const dir = try sys.join(&.{ ws.dir, trash_dir });
+            defer gpa.free(dir);
+            try sys.makePath(dir);
+            const name = try uniqueName(dir, stem(s.file), std.fs.path.extension(s.file));
+            defer gpa.free(name);
+            const from = try sys.join(&.{ ws.dir, s.file });
+            defer gpa.free(from);
+            const to = try sys.join(&.{ dir, name });
+            errdefer gpa.free(to);
+            try sys.rename(from, to);
+            parked = to;
+        }
+        errdefer if (parked) |p| gpa.free(p);
+        const ws_name = try gpa.dupe(u8, ws.name);
+        var sound = ws.sounds.orderedRemove(sound_idx);
+        sound.audio_id = -1;
+        lib.save(idx) catch {};
+        return .{ .ws_name = ws_name, .index = sound_idx, .sound = sound, .parked = parked };
+    }
+
+    /// Puts a trashed pad back where it was. Takes ownership of `t`.
+    pub fn restore(lib: *Library, t: *Trashed) !usize {
+        const idx = lib.find(t.ws_name) orelse return error.WorkspaceGone;
+        const ws = &lib.workspaces.items[idx];
+        if (t.parked) |from| {
+            // Its old name may have been taken in the meantime
+            const name = try uniqueName(ws.dir, stem(t.sound.file), std.fs.path.extension(t.sound.file));
+            defer gpa.free(name);
+            const to = try sys.join(&.{ ws.dir, name });
+            defer gpa.free(to);
+            try sys.rename(from, to);
+            const file = try gpa.dupe(u8, name);
+            gpa.free(t.sound.file);
+            t.sound.file = file;
+        } else if (ws.findByFile(t.sound.file) == null) {
+            return error.FileGone;
+        }
+        if (ws.findByUid(t.sound.uid) != null) t.sound.uid = ws.newUid();
+        const at = @min(t.index, ws.sounds.items.len);
+        try ws.sounds.insert(gpa, at, t.sound);
+        t.sound = undefined;
+        if (t.parked) |p| gpa.free(p);
+        gpa.free(t.ws_name);
+        lib.save(idx) catch {};
+        return at;
+    }
+
+    /// Trash from earlier sessions: the undo window is long gone
+    pub fn emptyTrash(lib: *Library) void {
+        for (lib.workspaces.items) |ws| {
+            const dir = sys.join(&.{ ws.dir, trash_dir }) catch continue;
+            defer gpa.free(dir);
+            sys.deleteTree(dir);
+        }
+    }
+};
+
+/// Folder inside each workspace where deleted pads wait for an undo
+pub const trash_dir = ".trash";
+
+/// A deleted pad that can still come back
+pub const Trashed = struct {
+    ws_name: []u8,
+    index: usize,
+    sound: Sound,
+    /// Where the file waits; null when variants still use it in place
+    parked: ?[]u8,
+
+    /// Forgets it for good (the parked file goes when the trash is emptied)
+    pub fn deinit(t: *Trashed) void {
+        if (t.parked) |p| {
+            sys.deleteFile(p);
+            gpa.free(p);
+        }
+        t.sound.deinit();
+        gpa.free(t.ws_name);
     }
 };
 

@@ -15,9 +15,10 @@
 
 Fire sounds into Discord, games and streams with hotkeys. Bend them live with an effect chain,<br>
 ride the levels on a mixer, go full screen on stage, record anything your PC plays.<br>
-One native executable. No Electron, no account, no API keys.
+One native executable. No Electron, no account, no telemetry, no API keys.
 
 **[Download](https://github.com/RshaCuDeVidro/WooferSoundPad/releases/latest)** &nbsp;·&nbsp;
+**[What's new](CHANGELOG.md)** &nbsp;·&nbsp;
 **[Tutorial](docs/TUTORIAL.md)** &nbsp;·&nbsp;
 **[Português](README.pt-BR.md)** &nbsp;·&nbsp;
 **[OBS & Stream Deck](#obs--stream-deck)**
@@ -38,21 +39,21 @@ One native executable. No Electron, no account, no API keys.
 
 **PLAY**
 
-Pads with waveforms, status LEDs and big readable hotkeys. Restart, overlap or toggle mode. A play queue with drag-to-reorder, shuffle and repeat. Global hotkeys while you game. A 0–9 number row.
+Pads with waveforms, status LEDs and big readable hotkeys. Restart, overlap or toggle mode. A play queue with drag-to-reorder, shuffle and repeat. Global hotkeys while you game. A 0–9 number row. Pads that play by themselves every N minutes or at a set time.
 
 </td>
 <td width="33%" valign="top">
 
 **SHAPE**
 
-Twelve live effects you can chain and reorder: pitch, filters, radio, distortion, bitcrusher, echo, reverb, chorus, tremolo, robot, gain. Automate any parameter over the sound. Save presets. Make variants of one file.
+Twelve live effects you can chain and reorder: pitch, filters, radio, distortion, bitcrusher, echo, reverb, chorus, tremolo, robot, gain. Automate any parameter over the sound. Save presets. Make variants of one file. A master EQ, compressor and limiter, and a global effect you hold a key for.
 
 </td>
 <td width="33%" valign="top">
 
 **PERFORM**
 
-A mixer with a channel strip per sound: meter, fader, mute, fade-out. Stage mode: full screen, huge pads, a panic button. A web deck for your phone and an overlay for OBS.
+A mixer with a channel strip per sound: meter, fader, mute, fade-out. Stage mode: full screen, huge pads, a panic button. A web deck for your phone (scan the QR code) and an overlay for OBS. Send a pad only to your headphones or only to the mic.
 
 </td>
 </tr>
@@ -61,21 +62,21 @@ A mixer with a channel strip per sound: meter, fader, mute, fade-out. Stage mode
 
 **EDIT**
 
-A zoomable waveform editor: drag to select, click to audition, fade handles on the wave, exact start and end with 10 ms nudges, auto-trim of silence, loop preview, undo and redo. Nothing touches the file until you say so.
+A zoomable waveform editor: drag to select, click to audition, fade handles on the wave, exact start and end with 10 ms nudges, auto-trim of silence, loop preview, undo and redo. Nothing touches the file until you say so. Slice a long recording into pads at its silences.
 
 </td>
 <td valign="top">
 
 **COLLECT**
 
-Browse MyInstants and SoundButtonsWorld inside the app. Search YouTube and SoundCloud or paste any of 1000+ sites (yt-dlp, no keys). Record what your computer is playing. Drag and drop files.
+Browse MyInstants and SoundButtonsWorld inside the app. Search YouTube and SoundCloud or paste any of 1000+ sites (yt-dlp, no keys). Record what your computer is playing. Drag and drop files, or drop them into a workspace folder.
 
 </td>
 <td valign="top">
 
 **KEEP**
 
-Workspaces are plain folders. Library-wide loudness normalization you can switch on and off. Statistics: total plays, time played, the meme ranking, a 14-day chart and your history. Portable mode for a USB stick.
+Workspaces are plain folders. Library-wide loudness normalization you can switch on and off. Statistics: total plays, time played, the meme ranking, a 14-day chart and your history. Portable mode for a USB stick. Search by what is said (offline, whisper.cpp). Ctrl+click many pads at once; deletes can be undone.
 
 </td>
 </tr>
@@ -140,6 +141,7 @@ Workspaces are plain folders. Library-wide loudness normalization you can switch
 - [Building from source](#building-from-source)
 - [Project structure](#project-structure)
 - [FAQ](#faq)
+- [Security and privacy](#security-and-privacy)
 - [Credits and license](#credits-and-license)
 
 <br>
@@ -150,9 +152,11 @@ Every release on the **[Releases page](https://github.com/RshaCuDeVidro/WooferSo
 
 | File | What it is |
 |---|---|
+| `WooferSoundPad-<version>-windows-x86_64-setup.exe` | **Windows, installer.** Start menu and desktop shortcuts, uninstall from Settings > Apps. No admin rights needed. |
 | `WooferSoundPad-<version>-windows-x86_64.exe` | **Windows.** The app itself: one file, double-click and go. |
 | `WooferSoundPad-<version>-windows-x86_64-portable.zip` | **Windows, portable.** Extract anywhere (a USB stick): settings, tools and sounds stay in the folder. |
 | `WooferSoundPad-<version>-windows-x86_64-compact.zip` | **Windows, compact.** Just the `.exe`, compressed to under half the size for slow connections. |
+| `WooferSoundPad-<version>-linux-x86_64.deb` | **Debian, Ubuntu, Mint.** Double-click (or `sudo apt install ./WooferSoundPad-*.deb`) and it is in the app menu. |
 | `WooferSoundPad-<version>-linux-x86_64` | **Linux.** The app itself: `chmod +x` it and run. |
 | `WooferSoundPad-<version>-linux-x86_64-compact` | **Linux, compact.** The same binary packed with UPX, about a third of the size; it unpacks in memory at start. |
 | `WooferSoundPad-<version>-linux-x86_64.tar.gz` | **Linux, with installer.** Adds it to your app menu with its icon: `./install.sh`. |
@@ -617,6 +621,18 @@ The executables are not code-signed, and small unsigned programs that download t
 WooferSoundPad is a client and hosts nothing. That content belongs to its owners and the sites' terms apply. Respect copyright and keep downloads for personal use.
 
 </details>
+
+<br>
+
+## Security and privacy
+
+WooferSoundPad has no account, no analytics and no crash reporting. Settings, statistics and your library stay on your computer.
+
+The only automatic network request is the update check: when the app opens, and every 12 hours after that, it asks the GitHub API for the latest release. Nothing is downloaded until you confirm, and the download is checked against the release's `SHA256SUMS.txt` before it is installed. Settings → Updates turns the check off.
+
+Everything else happens because you asked: Explore talks to MyInstants and SoundButtonsWorld, YouTube & more hands the link to yt-dlp, and the optional tools (yt-dlp, FFmpeg, Deno) come from their GitHub releases. The local control server is off by default and listens on `127.0.0.1` only unless you allow other devices.
+
+[PRIVACY.md](PRIVACY.md) lists every request. To report a vulnerability, use GitHub's private advisory as described in [SECURITY.md](SECURITY.md) instead of a public issue.
 
 <br>
 
