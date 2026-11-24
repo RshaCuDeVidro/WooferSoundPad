@@ -3,7 +3,7 @@
 Every release is built and published by GitHub Actions from a `v*` tag. The
 section for that version below becomes the release notes.
 
-## [1.1.0] - 2026-10-24
+## [1.1.0] - 2026-11-24
 
 ### Added
 

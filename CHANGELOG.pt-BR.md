@@ -3,7 +3,7 @@
 Cada versão é compilada e publicada pelo GitHub Actions a partir de uma tag `v*`.
 A versão em inglês, CHANGELOG.md, vira as notas do release.
 
-## [1.1.0] - 2026-10-24
+## [1.1.0] - 2026-11-24
 
 ### Novidades
 
