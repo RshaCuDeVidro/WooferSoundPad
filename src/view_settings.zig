@@ -764,7 +764,7 @@ fn librarySection(a: *App, l: *Layout) void {
 
 fn transcribeSection(a: *App, l: *Layout) void {
     sectionHeader(l, icons.audio_lines, a.t.sec_transcribe);
-    _ = card(l, 4, 0);
+    _ = card(l, 7, 0);
     var ctrl = row(l, a.t.tr_enable, a.t.tr_enable_desc, true);
     if (ui.toggle(ui.id("set-tr", 0), ctrl, &a.cfg.transcribe)) a.markConfig();
 
@@ -781,19 +781,68 @@ fn transcribeSection(a: *App, l: *Layout) void {
         }
     }
 
-    // The model (and the program on Windows), downloaded together
+    // The model: fast or precise, downloaded on demand (with the program on Windows)
+    const model = a.cfg.whisper_model;
+    ctrl = row(l, a.t.tr_model, if (model == .fast) a.t.tr_fast_desc else a.t.tr_precise_desc, false);
+    const models = [_]ui.Segment{ .{ .label = a.t.tr_fast, .icon = icons.zap }, .{ .label = a.t.tr_precise, .icon = icons.gem } };
+    var model_idx: usize = @backingInt(model);
+    if (ui.segmented(ui.id("tr-model", 0), .{ .x = ctrl.x, .y = ctrl.y, .w = 190, .h = ctrl.h }, &models, &model_idx)) {
+        a.cfg.whisper_model = @fromBackingInt(@intCast(model_idx));
+        a.markConfig();
+    }
+    const dl: Rect = .{ .x = ctrl.x + 198, .y = ctrl.y, .w = ctrl.w - 198, .h = ctrl.h };
     const need_program = transcribe.can_install_program and transcribe.program == null;
-    const model_ok = transcribe.modelReady();
-    ctrl = row(l, a.t.tr_model, if (model_ok) a.t.tr_model_ready else a.tf(a.t.tr_model_missing, .{transcribe.model_size_mb}), false);
     if (a.transcribe_setup) |setup| {
-        const stage = if (setup.stage.load(.acquire) == 0) a.t.tr_model else "whisper.cpp";
-        ui.label(stage, .{ .x = ctrl.x, .y = ctrl.y - 4, .w = ctrl.w, .h = 18 }, 11, .semibold, ui.colors.text_muted, .left);
-        ui.progressBar(.{ .x = ctrl.x, .y = ctrl.y + 22, .w = ctrl.w, .h = 5 }, setup.progress.get(), ui.colors.accent);
-    } else if (!model_ok or need_program) {
-        const mb = (if (model_ok) 0 else transcribe.model_size_mb) + (if (need_program) transcribe.program_size_mb else 0);
-        if (ui.button(ui.id("tr-setup", 0), .{ .x = ctrl.right() - 170, .y = ctrl.y, .w = 170, .h = ctrl.h }, a.tf(a.t.tr_download, .{mb}), .{ .icon = icons.download, .style = .primary, .size = 13 })) a.startWhisperSetup();
+        ui.progressBar(.{ .x = dl.x, .y = dl.y + dl.h / 2 - 2, .w = dl.w, .h = 5 }, setup.progress.get(), ui.colors.accent);
+    } else if (!transcribe.modelReady(model) or need_program) {
+        const mb = (if (transcribe.modelReady(model)) 0 else transcribe.modelSizeMb(model)) + (if (need_program) transcribe.program_size_mb else 0);
+        if (ui.button(ui.id("tr-setup", 0), dl, a.tf(a.t.tr_download, .{mb}), .{ .icon = icons.download, .style = .primary, .size = 12 })) {
+            a.startWhisperSetup(if (need_program) .cpu else null);
+        }
     } else {
-        ui.icon(icons.circle_check, .{ .x = ctrl.right() - 12, .y = ctrl.y + ctrl.h / 2 }, 16, ui.colors.success);
+        ui.icon(icons.circle_check, .{ .x = dl.right() - 12, .y = dl.y + dl.h / 2 }, 16, ui.colors.success);
+    }
+
+    // Language: detecting it costs a second pass over the audio
+    ctrl = row(l, a.t.tr_lang, a.t.tr_lang_desc, false);
+    const lang_names = [_][]const u8{ a.t.tr_lang_auto, "Português", "English", "Español", "Français", "Deutsch", "Italiano" };
+    var lang_idx: usize = 0;
+    for (transcribe.languages, 0..) |code, i| {
+        if (std.mem.eql(u8, code, a.cfg.whisper_language)) lang_idx = i;
+    }
+    if (ui.dropdown(ui.id("tr-lang", 0), ctrl, &lang_names, &lang_idx)) {
+        config.setString(&a.cfg.whisper_language, transcribe.languages[lang_idx]);
+        a.markConfig();
+    }
+
+    // How much of each sound
+    ctrl = row(l, a.t.tr_seconds, a.t.tr_seconds_desc, false);
+    const secs = [_]ui.Segment{ .{ .label = "15 s" }, .{ .label = "30 s" }, .{ .label = "60 s" } };
+    var secs_idx: usize = 0;
+    for (transcribe.durations, 0..) |d, i| {
+        if (d == a.cfg.whisper_seconds) secs_idx = i;
+    }
+    if (ui.segmented(ui.id("tr-secs", 0), ctrl, &secs, &secs_idx)) {
+        a.cfg.whisper_seconds = transcribe.durations[secs_idx];
+        a.markConfig();
+    }
+
+    // Graphics card: whether whisper.cpp may use it, and what the last run used
+    const last = a.transcribe_backend[0..a.transcribe_backend_len];
+    const on_cpu = std.mem.eql(u8, last, "CPU");
+    const gpu_desc = if (last.len == 0)
+        a.t.tr_gpu_desc
+    else if (on_cpu and a.cfg.whisper_gpu and !sys.is_windows)
+        a.t.tr_gpu_linux_hint
+    else
+        a.tf(a.t.tr_last_run, .{ last, a.transcribe_last_secs });
+    ctrl = row(l, a.t.tr_gpu, gpu_desc, false);
+    if (ui.toggle(ui.id("tr-gpu", 0), ctrl, &a.cfg.whisper_gpu)) a.markConfig();
+    // Windows: whisper.cpp's CUDA build, for NVIDIA cards
+    if (transcribe.can_install_program and a.cfg.whisper_gpu and a.transcribe_setup == null and transcribe.bundledFlavor() != .cuda) {
+        if (ui.button(ui.id("tr-cuda", 0), .{ .x = ctrl.x, .y = ctrl.y, .w = ctrl.w - 56, .h = ctrl.h }, a.tf(a.t.tr_gpu_download, .{transcribe.cuda_size_mb}), .{ .icon = icons.download, .style = .ghost, .size = 12, .tooltip = a.t.tr_gpu_download_tip })) {
+            a.startWhisperSetup(.cuda);
+        }
     }
 
     // How far it got

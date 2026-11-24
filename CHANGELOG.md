@@ -18,7 +18,7 @@ section for that version below becomes the release notes.
 - Undo for deletes: a deleted pad goes to a trash with an Undo button (and Ctrl+Z), instead of a confirmation dialog.
 - Slice at silences: one long recording becomes a pad per piece, with the cuts shown on the waveform before anything is written.
 - Watched folders: files dropped into a workspace folder become pads right away, and pads whose file was deleted go away.
-- Search by speech (optional, offline): whisper.cpp transcribes each sound once, and the search finds a sound by what is said in it.
+- Search by speech (optional, offline): whisper.cpp transcribes each sound once, and the search finds a sound by what is said in it. It uses the graphics card when the whisper.cpp build can (Vulkan, CUDA; an NVIDIA build is one click away on Windows), runs at the lowest CPU priority, and lets you pick a fast or a precise model, the language and how much of each sound to listen to.
 - A QR code for the web deck in Settings: point your phone's camera at it.
 - Windows installer with Start menu and desktop shortcuts and an uninstaller in Settings > Apps, and a `.deb` for Debian, Ubuntu and Mint.
 

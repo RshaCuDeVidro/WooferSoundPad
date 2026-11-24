@@ -249,6 +249,51 @@ pub fn run(argv: []const []const u8, max_output: usize) !RunResult {
     return .{ .ok = code == 0, .exit_code = code, .stdout = res.stdout, .stderr = res.stderr };
 }
 
+/// `run` for heavy background work: the child gets the lowest CPU priority,
+/// so the UI and the audio never wait for it. Call it from a worker thread.
+pub fn runLowPriority(argv: []const []const u8, max_output: usize) !RunResult {
+    if (!is_windows) {
+        // Linux keeps the nice value per thread and children inherit it
+        _ = setpriority(0, 0, 19);
+        return run(argv, max_output);
+    }
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .create_no_window = true,
+    });
+    defer child.kill(io);
+    _ = SetPriorityClass(child.id.?, 0x40); // IDLE_PRIORITY_CLASS
+
+    // Both pipes at once, like std.process.run, so neither fills up and stalls
+    var buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi: std.Io.File.MultiReader = undefined;
+    multi.init(gpa, io, buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi.deinit();
+    while (multi.fill(64 * 1024, .none)) |_| {
+        if (multi.reader(0).buffered().len > max_output) return error.StreamTooLong;
+        if (multi.reader(1).buffered().len > 1024 * 1024) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+    try multi.checkAnyError();
+    const term = try child.wait(io);
+    const stdout = try multi.toOwnedSlice(0);
+    errdefer gpa.free(stdout);
+    const stderr = try multi.toOwnedSlice(1);
+    const code: u8 = switch (term) {
+        .exited => |c| c,
+        else => 255,
+    };
+    return .{ .ok = code == 0, .exit_code = code, .stdout = stdout, .stderr = stderr };
+}
+
+extern "c" fn setpriority(which: c_int, who: c_uint, prio: c_int) c_int;
+extern "kernel32" fn SetPriorityClass(process: std.os.windows.HANDLE, class: u32) callconv(.winapi) c_int;
+
 /// Starts a program and forgets about it (a helper thread reaps it)
 pub fn spawnDetached(argv: []const []const u8) void {
     var child = std.process.spawn(io, .{

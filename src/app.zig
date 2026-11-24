@@ -295,6 +295,11 @@ pub const App = struct {
     /// Failures in a row; transcription pauses at 3
     transcribe_failures: u32 = 0,
     transcribe_polled_at: f32 = 0,
+    transcribe_started_at: f32 = 0,
+    /// What the last transcription ran on and how long it took (for Settings)
+    transcribe_backend: [96]u8 = undefined,
+    transcribe_backend_len: usize = 0,
+    transcribe_last_secs: f32 = 0,
     /// Global effect: held by its hotkey, latched by a button, or previewed
     global_fx_held: bool = false,
     global_fx_latched: bool = false,
@@ -1710,9 +1715,11 @@ pub const App = struct {
         return std.hash.Wyhash.hash(uid, ws_name);
     }
 
-    pub fn startWhisperSetup(a: *App) void {
+    /// Downloads the chosen model if missing, and on Windows the program build
+    /// given (`.cuda` for NVIDIA cards)
+    pub fn startWhisperSetup(a: *App, flavor: ?transcribe.Flavor) void {
         if (a.transcribe_setup != null) return;
-        a.transcribe_setup = transcribe.Setup.start() catch |err| {
+        a.transcribe_setup = transcribe.Setup.start(a.cfg.whisper_model, flavor) catch |err| {
             ui.toastFmt(.err, "{s}", .{@errorName(err)});
             return;
         };
@@ -1769,6 +1776,12 @@ pub const App = struct {
                 t.free();
                 a.transcribe_task = null;
             }
+            const backend = t.backendText();
+            if (backend.len > 0) {
+                a.transcribe_backend_len = @min(backend.len, a.transcribe_backend.len);
+                @memcpy(a.transcribe_backend[0..a.transcribe_backend_len], backend[0..a.transcribe_backend_len]);
+                a.transcribe_last_secs = ui.time - a.transcribe_started_at;
+            }
             const ws_idx = a.lib.find(t.ws_name) orelse return;
             const ws = &a.lib.workspaces.items[ws_idx];
             const idx = ws.findByUid(t.uid) orelse return;
@@ -1782,7 +1795,7 @@ pub const App = struct {
             }
             return;
         }
-        if (!a.cfg.transcribe or a.transcribeStalled() or !transcribe.ready()) return;
+        if (!a.cfg.transcribe or a.transcribeStalled() or !transcribe.ready(a.cfg.whisper_model)) return;
         if (ui.time - a.transcribe_polled_at < 0.5) return;
         a.transcribe_polled_at = ui.time;
         // The active workspace first, then the rest
@@ -1795,7 +1808,13 @@ pub const App = struct {
                 if (std.mem.indexOfScalar(u64, a.transcribe_failed.items, transcribeKey(ws.name, s.uid)) != null) continue;
                 const path = ws.soundPath(s) catch return;
                 defer gpa.free(path);
-                a.transcribe_task = transcribe.Task.start(path, ws.name, s.uid) catch return;
+                a.transcribe_task = transcribe.Task.start(path, ws.name, s.uid, .{
+                    .model = a.cfg.whisper_model,
+                    .language = a.cfg.whisper_language,
+                    .seconds = a.cfg.whisper_seconds,
+                    .gpu = a.cfg.whisper_gpu,
+                }) catch return;
+                a.transcribe_started_at = ui.time;
                 return;
             }
         }

@@ -11,6 +11,7 @@ pub const SortMode = enum { manual, name, recent, most_played };
 pub const AudioFormat = enum { mp3, ogg, wav };
 pub const ExploreSource = enum { myinstants, soundbuttonsworld };
 pub const OnlinePlatform = enum { youtube, soundcloud, link };
+pub const WhisperModel = enum { fast, precise };
 
 pub const Config = struct {
     version: u32 = 1,
@@ -80,6 +81,13 @@ pub const Config = struct {
     // Search by what is said: whisper.cpp transcribes each sound once
     transcribe: bool = false,
     whisper_path: []const u8 = "",
+    whisper_model: WhisperModel = .precise,
+    /// whisper language code; "auto" detects it (a second pass over the audio)
+    whisper_language: []const u8 = "auto",
+    /// How much of each sound is listened to
+    whisper_seconds: u32 = 15,
+    /// Use the graphics card when the whisper.cpp build can
+    whisper_gpu: bool = true,
 
     // Effects: presets saved by the user (built-ins live in fx.zig)
     fx_presets: []const fx.UserPreset = &.{},
@@ -175,6 +183,7 @@ fn sanitize(cfg_in: Config) Config {
     cfg.master_eq_mid = std.math.clamp(cfg.master_eq_mid, -12, 12);
     cfg.master_eq_high = std.math.clamp(cfg.master_eq_high, -12, 12);
     cfg.master_comp = std.math.clamp(cfg.master_comp, 0, 1);
+    cfg.whisper_seconds = std.math.clamp(cfg.whisper_seconds, 5, 60);
     cfg.window_width = @max(cfg.window_width, 960);
     cfg.window_height = @max(cfg.window_height, 600);
     return cfg;

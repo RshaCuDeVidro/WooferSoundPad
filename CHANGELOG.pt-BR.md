@@ -18,7 +18,7 @@ A versão em inglês, CHANGELOG.md, vira as notas do release.
 - Desfazer ao apagar: o pad apagado vai para uma lixeira com um botão Desfazer (e Ctrl+Z), no lugar da caixa de confirmação.
 - Fatiar nos silêncios: uma gravação longa vira um pad por pedaço, com os cortes mostrados na forma de onda antes de gravar qualquer coisa.
 - Pastas monitoradas: arquivos colocados na pasta de um workspace viram pads na hora, e pads cujo arquivo foi apagado somem.
-- Busca pela fala (opcional, offline): o whisper.cpp transcreve cada som uma vez, e a busca acha o som pelo que é dito nele.
+- Busca pela fala (opcional, offline): o whisper.cpp transcreve cada som uma vez, e a busca acha o som pelo que é dito nele. Usa a placa de vídeo quando o whisper.cpp tem suporte (Vulkan, CUDA; no Windows a versão NVIDIA está a um clique), roda com a menor prioridade de CPU e deixa escolher modelo rápido ou preciso, o idioma e quanto de cada som ouvir.
 - QR code do web deck nas Configurações: é só apontar a câmera do celular.
 - Instalador para Windows com atalhos no menu Iniciar e na área de trabalho e desinstalador em Configurações > Aplicativos, e um `.deb` para Debian, Ubuntu e Mint.
 
