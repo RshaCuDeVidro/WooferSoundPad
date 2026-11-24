@@ -22,7 +22,7 @@ jobs:
     name: Linux x86_64
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install X11 / OpenGL headers
         run: |
@@ -47,7 +47,7 @@ jobs:
       - name: Smoke test (generic x86_64 CPU)
         run: qemu-x86_64 -cpu qemu64 ./zig-out/bin/WooferSoundPad --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: WooferSoundPad-linux-x86_64
           path: zig-out/bin/WooferSoundPad
@@ -57,7 +57,7 @@ jobs:
     name: Windows x86_64 (cross-compiled)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -66,7 +66,7 @@ jobs:
       - name: Build (ReleaseSmall, x86_64-windows)
         run: zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows -Dversion=0.0.0-ci.${GITHUB_SHA::7}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: WooferSoundPad-windows-x86_64
           path: zig-out/bin/WooferSoundPad.exe
