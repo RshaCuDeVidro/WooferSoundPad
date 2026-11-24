@@ -39,7 +39,7 @@ Do zero até soltar sons com efeito na call do Discord em uns dez minutos.
 
 1. Baixe o arquivo na [página de Releases](https://github.com/RshaCuDeVidro/WooferSoundPad/releases/latest):
    - **Windows:** `WooferSoundPad-<versão>-windows-x86_64.exe`. Dois cliques. Se o SmartScreen reclamar, *Mais informações → Executar assim mesmo* (o app não é assinado). Prefere tudo numa pasta só? Pegue o `-portable.zip`.
-   - **Linux:** `WooferSoundPad-<versão>-linux-x86_64.tar.gz`, extraia e rode `./install.sh` pra ele aparecer no menu de apps. Ou pegue o binário `-linux-x86_64`, dê `chmod +x` e rode.
+   - **Linux:** rode `curl -fsSL https://raw.githubusercontent.com/RshaCuDeVidro/WooferSoundPad/main/install.sh | sh` e ele aparece no menu de apps. Ou pegue o binário `-linux-x86_64`, dê `chmod +x` e rode.
 2. Um tour de cinco passos aparece. Avance ou clique em *Pular*; **F1** abre de novo.
 3. O app fala português e inglês e escolhe o idioma do sistema. Troque em *Configurações → Aparência*.
 

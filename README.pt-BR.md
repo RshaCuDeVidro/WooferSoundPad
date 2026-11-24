@@ -185,14 +185,19 @@ Cada versão na **[página de Releases](https://github.com/RshaCuDeVidro/WooferS
 
 <br>
 
+Uma linha, sem extrair nada: baixa a última versão, confere o SHA-256 e põe o WooferSoundPad no menu de apps com o ícone.
+
 ```sh
-tar -xzf WooferSoundPad-*-linux-x86_64.tar.gz
-cd WooferSoundPad
-./install.sh              # ~/.local/bin, entrada no menu e ícone
-./install.sh --uninstall  # remove de novo; seus sons e configurações ficam
+curl -fsSL https://raw.githubusercontent.com/RshaCuDeVidro/WooferSoundPad/main/install.sh | sh
 ```
 
-Não precisa de root. `sudo PREFIX=/usr/local ./install.sh` instala pro sistema todo.
+Rode de novo pra atualizar. Pra remover (seus sons e configurações ficam):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/RshaCuDeVidro/WooferSoundPad/main/install.sh | sh -s -- --uninstall
+```
+
+Não precisa de root: vai pra `~/.local`. `sudo PREFIX=/usr/local sh install.sh` instala pro sistema todo. O mesmo `install.sh` vem no `.tar.gz`, onde instala o binário que está do lado.
 
 </details>
 

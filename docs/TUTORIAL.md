@@ -39,7 +39,7 @@ From zero to firing sounds into your Discord call, with effects, in about ten mi
 
 1. Get your file from the [Releases page](https://github.com/RshaCuDeVidro/WooferSoundPad/releases/latest):
    - **Windows:** `WooferSoundPad-<version>-windows-x86_64.exe`. Double-click it. If SmartScreen complains, choose *More info → Run anyway* (the app is not code-signed). Prefer everything in one folder? Take the `-portable.zip` instead.
-   - **Linux:** `WooferSoundPad-<version>-linux-x86_64.tar.gz`, extract it and run `./install.sh` to get it in your app menu. Or grab the bare `-linux-x86_64` binary, `chmod +x` it and run it.
+   - **Linux:** run `curl -fsSL https://raw.githubusercontent.com/RshaCuDeVidro/WooferSoundPad/main/install.sh | sh` and it lands in your app menu. Or grab the bare `-linux-x86_64` binary, `chmod +x` it and run it.
 2. A five-step tour opens. Click through or *Skip*; **F1** brings it back.
 3. The app speaks English and Brazilian Portuguese and picks your system language. Change it in *Settings → Appearance*.
 
