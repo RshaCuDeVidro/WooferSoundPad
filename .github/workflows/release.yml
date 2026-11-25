@@ -30,7 +30,7 @@ jobs:
     name: Build, package, publish
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve version
         id: ver
@@ -188,7 +188,7 @@ jobs:
           } > notes.md
           cat notes.md >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: WooferSoundPad-${{ steps.ver.outputs.version }}
           path: |
@@ -198,7 +198,7 @@ jobs:
 
       - name: Publish the release
         if: steps.ver.outputs.publish == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           name: WooferSoundPad ${{ steps.ver.outputs.version }}
